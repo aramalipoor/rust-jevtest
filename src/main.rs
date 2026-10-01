@@ -563,8 +563,8 @@ impl Report<'_> {
                 format!(", selected {} (>= {})", self.count_selected(Reason::Jev), self.cli.threshold)
             };
             eprintln!(
-                "jev {stage}: asked {asked}{kept}; {} requests, {} cache hits, {} input + {} output tokens, {} ms",
-                u.requests, u.cache_hits, u.input_tokens, u.output_tokens, u.wall_ms
+                "jev {stage}: asked {asked}{kept}; {} requests ({} split as too large), {} cache hits, {} input + {} output tokens, {} ms",
+                u.requests, u.splits, u.cache_hits, u.input_tokens, u.output_tokens, u.wall_ms
             );
             for f in &u.failures {
                 eprintln!("jev {stage} FAILED: {f}; its tests selected unjudged");
@@ -587,6 +587,7 @@ impl Report<'_> {
                     "asked": asked,
                     "requests": u.requests,
                     "cache_hits": u.cache_hits,
+                    "splits": u.splits,
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
                     "wall_ms": u.wall_ms as u64,

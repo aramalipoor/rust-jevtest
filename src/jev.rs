@@ -67,14 +67,29 @@ pub fn group_question(package: &str, file: &str, module: &str, tests: &[&str], c
 pub struct Usage {
     pub requests: u32,
     pub cache_hits: u32,
+    /// Requests rejected as too large and retried as two halves.
+    pub splits: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub wall_ms: u128,
     pub failures: Vec<String>,
 }
 
+impl Usage {
+    fn add(&mut self, other: Usage) {
+        self.requests += other.requests;
+        self.cache_hits += other.cache_hits;
+        self.splits += other.splits;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.failures.extend(other.failures);
+    }
+}
+
 enum Batch {
     Answered { nouls: Vec<f64>, cached: bool, input_tokens: u64, output_tokens: u64 },
+    /// The API refused the request size (`max_tokens_exceeded`, 413 or 422).
+    TooLarge(String),
     Failed(String),
 }
 
@@ -116,28 +131,24 @@ impl Client {
         })
     }
 
-    /// Asks one Noul per question, `batch` per request; `None` for questions whose batch failed (unjudged).
+    /// Asks one Noul per question, up to `batch` per request; `None` for questions whose batch failed (unjudged).
+    /// A request the API refuses as too large is retried as two halves, recursively.
     pub fn judge(&self, state: &Value, questions: Vec<Value>, batch: usize, concurrency: usize) -> (Vec<Option<f64>>, Usage) {
         let started = Instant::now();
-        let total = questions.len();
-        let mut bodies: Vec<String> = Vec::new();
-        let mut it = questions.into_iter().peekable();
-        while it.peek().is_some() {
-            let qs: Map<String, Value> = it.by_ref().take(batch.max(1)).enumerate().map(|(i, q)| (format!("t{i}"), q)).collect();
-            bodies.push(json!({"model": self.model, "state": state, "questions": qs}).to_string());
-        }
+        let chunks: Vec<&[Value]> = questions.chunks(batch.max(1)).collect();
         let next = AtomicUsize::new(0);
-        let mut results: Vec<Option<Batch>> = bodies.iter().map(|_| None).collect();
+        let mut results: Vec<Option<(Vec<Option<f64>>, Usage)>> = chunks.iter().map(|_| None).collect();
         std::thread::scope(|s| {
-            let workers: Vec<_> = (0..concurrency.clamp(1, bodies.len().max(1)))
+            let workers: Vec<_> = (0..concurrency.clamp(1, chunks.len().max(1)))
                 .map(|_| {
                     s.spawn(|| {
                         let mut done = Vec::new();
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(body) = bodies.get(i) else { break };
-                            let n = total.min((i + 1) * batch.max(1)) - i * batch.max(1);
-                            done.push((i, self.ask(body, n)));
+                            let Some(chunk) = chunks.get(i) else { break };
+                            let mut usage = Usage::default();
+                            let nouls = self.ask_split(state, chunk, &mut usage);
+                            done.push((i, (nouls, usage)));
                         }
                         done
                     })
@@ -151,29 +162,58 @@ impl Client {
         });
 
         let mut usage = Usage::default();
-        let mut nouls = Vec::with_capacity(total);
+        let mut nouls = Vec::with_capacity(questions.len());
         for (i, r) in results.into_iter().enumerate() {
-            let n = total.min((i + 1) * batch.max(1)) - i * batch.max(1);
-            match r.unwrap_or_else(|| Batch::Failed("worker panicked".into())) {
-                Batch::Answered { nouls: got, cached, input_tokens, output_tokens } => {
-                    if cached {
-                        usage.cache_hits += 1;
-                    } else {
-                        usage.requests += 1;
-                        usage.input_tokens += input_tokens;
-                        usage.output_tokens += output_tokens;
-                    }
-                    nouls.extend(got.into_iter().map(Some));
+            match r {
+                Some((got, u)) => {
+                    nouls.extend(got);
+                    usage.add(u);
                 }
-                Batch::Failed(why) => {
-                    usage.requests += 1;
-                    usage.failures.push(format!("batch {i}: {why}"));
-                    nouls.extend(std::iter::repeat_n(None, n));
+                None => {
+                    usage.failures.push(format!("batch {i}: worker panicked"));
+                    nouls.extend(std::iter::repeat_n(None, chunks[i].len()));
                 }
             }
         }
         usage.wall_ms = started.elapsed().as_millis();
         (nouls, usage)
+    }
+
+    fn ask_split(&self, state: &Value, qs: &[Value], usage: &mut Usage) -> Vec<Option<f64>> {
+        let questions: Map<String, Value> = qs.iter().enumerate().map(|(i, q)| (format!("t{i}"), q.clone())).collect();
+        let body = json!({"model": self.model, "state": state, "questions": questions}).to_string();
+        match self.ask(&body, qs.len()) {
+            Batch::Answered { nouls, cached, input_tokens, output_tokens } => {
+                if cached {
+                    usage.cache_hits += 1;
+                } else {
+                    usage.requests += 1;
+                    usage.input_tokens += input_tokens;
+                    usage.output_tokens += output_tokens;
+                }
+                nouls.into_iter().map(Some).collect()
+            }
+            Batch::TooLarge(_) if qs.len() > 1 => {
+                usage.requests += 1;
+                usage.splits += 1;
+                let (a, b) = qs.split_at(qs.len() / 2);
+                let (mut ua, mut ub) = (Usage::default(), Usage::default());
+                let (mut nouls, rest) = std::thread::scope(|s| {
+                    let first = s.spawn(|| self.ask_split(state, a, &mut ua));
+                    let rest = self.ask_split(state, b, &mut ub);
+                    (first.join().unwrap_or_else(|_| vec![None; a.len()]), rest)
+                });
+                usage.add(ua);
+                usage.add(ub);
+                nouls.extend(rest);
+                nouls
+            }
+            Batch::TooLarge(why) | Batch::Failed(why) => {
+                usage.requests += 1;
+                usage.failures.push(format!("{} questions: {why}", qs.len()));
+                vec![None; qs.len()]
+            }
+        }
     }
 
     fn cache_path(&self, body: &str) -> Option<PathBuf> {
@@ -212,8 +252,12 @@ impl Client {
                 break text;
             }
             attempt += 1;
+            let detail = format!("HTTP {status}: {}", truncate(text.trim(), 300));
+            if status == 413 || status == 422 || (status == 400 && text.contains("max_tokens_exceeded")) {
+                return Batch::TooLarge(detail);
+            }
             if !RETRY_STATUSES.contains(&status) || attempt >= ATTEMPTS {
-                return Batch::Failed(format!("HTTP {status}: {}", truncate(text.trim(), 300)));
+                return Batch::Failed(detail);
             }
             std::thread::sleep(Duration::from_millis(500 << (attempt - 1)));
         };
