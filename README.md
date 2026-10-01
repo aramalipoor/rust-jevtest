@@ -1,8 +1,10 @@
 # cargo-jevtest
 
 Picks the Rust tests worth running for a git diff: changed packages plus their reverse
-dependencies, static test enumeration with syn, then one TypeSafe Jev Noul per candidate test.
-Prints (or runs) a `cargo nextest run` command limited to the selected tests.
+dependencies, static test enumeration with syn, then TypeSafe Jev in two stages: one Noul per
+(package, file, module) group of tests, then one per test inside the groups that stay in
+(`--group-threshold`, `--threshold`). Prints (or runs) a `cargo nextest run` command limited to
+the selected tests.
 
 ## Usage
 

@@ -34,8 +34,8 @@ struct Cli {
     /// Minimum group Noul (stage 1) for a group's tests to be asked about one by one.
     #[arg(long, default_value_t = 0.1)]
     group_threshold: f64,
-    /// Questions per Jev request.
-    #[arg(long, default_value_t = 200)]
+    /// Questions per Jev request (requests the API refuses as too large are split in half).
+    #[arg(long, default_value_t = 100)]
     batch: usize,
     /// Concurrent Jev requests.
     #[arg(long, default_value_t = 4)]

@@ -89,7 +89,7 @@ impl Usage {
 enum Batch {
     Answered { nouls: Vec<f64>, cached: bool, input_tokens: u64, output_tokens: u64 },
     /// The API refused the request size (`max_tokens_exceeded`, 413 or 422).
-    TooLarge(String),
+    TooLarge { detail: String, cached: bool },
     Failed(String),
 }
 
@@ -193,8 +193,12 @@ impl Client {
                 }
                 nouls.into_iter().map(Some).collect()
             }
-            Batch::TooLarge(_) if qs.len() > 1 => {
-                usage.requests += 1;
+            Batch::TooLarge { cached, .. } if qs.len() > 1 => {
+                if cached {
+                    usage.cache_hits += 1;
+                } else {
+                    usage.requests += 1;
+                }
                 usage.splits += 1;
                 let (a, b) = qs.split_at(qs.len() / 2);
                 let (mut ua, mut ub) = (Usage::default(), Usage::default());
@@ -208,7 +212,7 @@ impl Client {
                 nouls.extend(rest);
                 nouls
             }
-            Batch::TooLarge(why) | Batch::Failed(why) => {
+            Batch::TooLarge { detail: why, .. } | Batch::Failed(why) => {
                 usage.requests += 1;
                 usage.failures.push(format!("{} questions: {why}", qs.len()));
                 vec![None; qs.len()]
@@ -234,6 +238,13 @@ impl Client {
         {
             return Batch::Answered { nouls, cached: true, input_tokens, output_tokens };
         }
+        // A size refusal is cached too, so reruns split straight away without a network call.
+        let refusal = cache.as_ref().map(|p| p.with_extension("too-large"));
+        if let Some(path) = &refusal
+            && let Ok(detail) = std::fs::read_to_string(path)
+        {
+            return Batch::TooLarge { detail, cached: true };
+        }
         let mut attempt = 0;
         let text = loop {
             let sent = self
@@ -254,7 +265,10 @@ impl Client {
             attempt += 1;
             let detail = format!("HTTP {status}: {}", truncate(text.trim(), 300));
             if status == 413 || status == 422 || (status == 400 && text.contains("max_tokens_exceeded")) {
-                return Batch::TooLarge(detail);
+                if let Some(path) = &refusal {
+                    write_atomic(path, &detail);
+                }
+                return Batch::TooLarge { detail, cached: false };
             }
             if !RETRY_STATUSES.contains(&status) || attempt >= ATTEMPTS {
                 return Batch::Failed(detail);
@@ -264,15 +278,19 @@ impl Client {
         match parse(&text, n) {
             Ok(answered) => {
                 if let Some(path) = &cache {
-                    let tmp = path.with_extension("tmp");
-                    if std::fs::write(&tmp, &text).is_ok() {
-                        let _ = std::fs::rename(&tmp, path);
-                    }
+                    write_atomic(path, &text);
                 }
                 answered
             }
             Err(why) => Batch::Failed(why),
         }
+    }
+}
+
+fn write_atomic(path: &std::path::Path, text: &str) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
