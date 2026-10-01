@@ -31,21 +31,27 @@ struct Cli {
     /// Minimum Noul for a judged test to be selected.
     #[arg(long, default_value_t = 0.2)]
     threshold: f64,
+    /// Minimum group Noul (stage 1) for a group's tests to be asked about one by one.
+    #[arg(long, default_value_t = 0.1)]
+    group_threshold: f64,
     /// Questions per Jev request.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 200)]
     batch: usize,
     /// Concurrent Jev requests.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
-    /// Most tests to ask Jev about; the rest are selected unjudged.
+    /// Most Jev questions (groups + tests); tests past it are selected unjudged.
     #[arg(long, default_value_t = 1500)]
     max_questions: usize,
     /// Diff characters given to Jev.
     #[arg(long, default_value_t = 24000)]
     max_state_chars: usize,
     /// Test source characters given to Jev per test.
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = 800)]
     max_test_chars: usize,
+    /// Module context characters given to Jev per group.
+    #[arg(long, default_value_t = 600)]
+    max_group_chars: usize,
     /// Extra glob of changed files to ignore (repeatable).
     #[arg(long, value_name = "GLOB")]
     ignore: Vec<String>,
@@ -74,6 +80,7 @@ enum Reason {
     Changed,
     Package,
     Jev,
+    JevGroup,
     Unjudged,
 }
 
@@ -83,6 +90,7 @@ impl Reason {
             Reason::Changed => "changed",
             Reason::Package => "package",
             Reason::Jev => "jev",
+            Reason::JevGroup => "jev-group",
             Reason::Unjudged => "unjudged",
         }
     }
@@ -100,6 +108,8 @@ struct Candidate {
     pkg: usize,
     test: TestFn,
     reason: Reason,
+    /// Stage-1 Noul of the test's group, when asked.
+    group_noul: Option<f64>,
     noul: Option<f64>,
     selected: bool,
 }
@@ -234,7 +244,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         ignored: &ignored,
         symbols: &symbols,
         candidates: Vec::new(),
-        usage: None,
+        groups: 0,
+        kept_groups: 0,
+        stages: Vec::new(),
         jev_error: None,
         expr: None,
         command: Vec::new(),
@@ -260,13 +272,19 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         .filter_map(|f| Some((f.new_path.as_deref()?, f.new_ranges.as_slice())))
         .collect();
     let mut candidates: Vec<Candidate> = Vec::new();
+    // (file, module) → that module's context for stage-1 group questions.
+    let mut contexts: HashMap<(String, String), String> = HashMap::new();
     for &(pkg, _) in &affected {
         let pdir = ws.packages[pkg].dir.as_str();
         for path in test_files(&source.list(&root, pdir)?, pdir) {
             let rel = if pdir.is_empty() { path.as_str() } else { &path[pdir.len() + 1..] };
             let Some(src) = source.read(&path) else { continue };
             let tests = match syn::parse_file(&src) {
-                Ok(file) => scan::tests_in(&file, &path, &scan::module_base(rel), &src),
+                Ok(file) => {
+                    let (tests, ctx) = scan::tests_in(&file, &path, &scan::module_base(rel), &src);
+                    contexts.extend(ctx.into_iter().map(|(module, c)| ((path.clone(), module), c)));
+                    tests
+                }
                 Err(e) => {
                     if whole.insert(pkg) {
                         report.escalations.push(Escalation { file: path.clone(), kind: "whole", package: Some(pkg), reason: format!("does not parse: {e}") });
@@ -279,7 +297,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             for test in tests {
                 let hit = ranges.iter().any(|&(a, b)| a <= test.end && test.start <= b);
                 let reason = if hit { Reason::Changed } else { Reason::Unjudged };
-                candidates.push(Candidate { pkg, test, reason, noul: None, selected: false });
+                candidates.push(Candidate { pkg, test, reason, group_noul: None, noul: None, selected: false });
             }
         }
     }
@@ -290,10 +308,21 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
     report.affected = affected;
 
-    // Step 5: Jev for non-must candidates.
+    // Step 5: Jev for non-must candidates, in two stages. Stage 1 asks one Noul per
+    // (package, file, module) group; stage 2 asks per test inside groups that stay in.
     let open: Vec<usize> = (0..candidates.len()).filter(|&i| candidates[i].reason == Reason::Unjudged).collect();
-    let asked = &open[..open.len().min(cli.max_questions)];
-    if !cli.no_jev && !asked.is_empty() {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<(&str, &str), usize> = HashMap::new();
+    for &i in &open {
+        let t = &candidates[i].test;
+        let g = *group_of.entry((t.file.as_str(), t.module.as_str())).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    drop(group_of);
+    if !cli.no_jev && !open.is_empty() {
         match jev::Client::from_env() {
             Ok(client) => {
                 let diff = git::context_diff(&root, &base, head)?;
@@ -304,25 +333,71 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     "changed_symbols": symbols,
                     "diff": diff,
                 }});
-                let questions: Vec<jev::Question> = asked
+
+                let asked_groups = &groups[..groups.len().min(cli.max_questions)];
+                let questions: Vec<Value> = asked_groups
                     .iter()
-                    .map(|&i| jev::Question { package: &ws.packages[candidates[i].pkg].name, test: &candidates[i].test })
+                    .map(|members| {
+                        let first = &candidates[members[0]];
+                        let names: Vec<&str> = members.iter().map(|&i| candidates[i].test.name.as_str()).collect();
+                        let key = (first.test.file.clone(), first.test.module.clone());
+                        let context = contexts.get(&key).map(String::as_str).unwrap_or_default();
+                        jev::group_question(
+                            &ws.packages[first.pkg].name,
+                            &first.test.file,
+                            &first.test.module,
+                            &names,
+                            jev::truncate(context, cli.max_group_chars),
+                        )
+                    })
                     .collect();
-                let (nouls, usage) = client.judge(&state, &questions, cli.batch, cli.concurrency, cli.max_test_chars);
-                for (&i, noul) in asked.iter().zip(nouls) {
-                    if let Some(n) = noul {
-                        candidates[i].reason = Reason::Jev;
-                        candidates[i].noul = Some(n);
+                let (group_nouls, usage) = client.judge(&state, questions, cli.batch, cli.concurrency);
+                report.stages.push(("groups", asked_groups.len(), usage));
+
+                let mut stage2: Vec<usize> = Vec::new();
+                for (members, noul) in asked_groups.iter().zip(group_nouls) {
+                    let Some(n) = noul else { continue };
+                    for &i in members {
+                        candidates[i].group_noul = Some(n);
+                    }
+                    if n < cli.group_threshold {
+                        for &i in members {
+                            candidates[i].reason = Reason::JevGroup;
+                        }
+                        continue;
+                    }
+                    report.kept_groups += 1;
+                    if let [only] = members.as_slice() {
+                        candidates[*only].reason = Reason::Jev;
+                        candidates[*only].noul = Some(n);
+                    } else {
+                        stage2.extend(members);
                     }
                 }
-                report.usage = Some(usage);
+                stage2.truncate(cli.max_questions - asked_groups.len());
+                if !stage2.is_empty() {
+                    let questions: Vec<Value> = stage2
+                        .iter()
+                        .map(|&i| jev::test_question(&ws.packages[candidates[i].pkg].name, &candidates[i].test, cli.max_test_chars))
+                        .collect();
+                    let (nouls, usage) = client.judge(&state, questions, cli.batch, cli.concurrency);
+                    report.stages.push(("tests", stage2.len(), usage));
+                    for (&i, noul) in stage2.iter().zip(nouls) {
+                        if let Some(n) = noul {
+                            candidates[i].reason = Reason::Jev;
+                            candidates[i].noul = Some(n);
+                        }
+                    }
+                }
             }
             Err(e) => report.jev_error = Some(e),
         }
     }
+    report.groups = groups.len();
     for c in &mut candidates {
         c.selected = match c.reason {
             Reason::Jev => c.noul.is_some_and(|n| n >= cli.threshold),
+            Reason::JevGroup => false,
             _ => true,
         };
     }
@@ -425,7 +500,11 @@ struct Report<'a> {
     ignored: &'a [&'a str],
     symbols: &'a [String],
     candidates: Vec<Candidate>,
-    usage: Option<jev::Usage>,
+    /// Stage-1 groups formed from non-must candidates, and how many stayed in (Noul >= --group-threshold).
+    groups: usize,
+    kept_groups: usize,
+    /// Per Jev stage: name, questions asked, usage.
+    stages: Vec<(&'static str, usize, jev::Usage)>,
     jev_error: Option<String>,
     expr: Option<String>,
     command: Vec<String>,
@@ -464,9 +543,11 @@ impl Report<'_> {
         let changed = self.count(Reason::Changed);
         let package = self.count(Reason::Package);
         eprintln!(
-            "candidates {}  must {} (changed {changed}, package {package})  judged {}  selected {selected}  unjudged {}",
+            "candidates {}  must {} (changed {changed}, package {package})  groups {}  group-dropped {}  judged {}  selected {selected}  unjudged {}",
             self.candidates.len(),
             changed + package,
+            self.groups,
+            self.count(Reason::JevGroup),
             self.count(Reason::Jev),
             self.count(Reason::Unjudged),
         );
@@ -474,29 +555,45 @@ impl Report<'_> {
             eprintln!("jev: off (--no-jev)");
         } else if let Some(e) = &self.jev_error {
             eprintln!("jev FAILED: {e}; unjudged tests selected");
-        } else if let Some(u) = &self.usage {
+        }
+        for (stage, asked, u) in &self.stages {
+            let kept = if *stage == "groups" {
+                format!(", kept {} (>= {})", self.kept_groups, self.cli.group_threshold)
+            } else {
+                format!(", selected {} (>= {})", self.count_selected(Reason::Jev), self.cli.threshold)
+            };
             eprintln!(
-                "jev: {} requests, {} cache hits, {} input + {} output tokens, {} ms, threshold {}",
-                u.requests, u.cache_hits, u.input_tokens, u.output_tokens, u.wall_ms, self.cli.threshold
+                "jev {stage}: asked {asked}{kept}; {} requests, {} cache hits, {} input + {} output tokens, {} ms",
+                u.requests, u.cache_hits, u.input_tokens, u.output_tokens, u.wall_ms
             );
             for f in &u.failures {
-                eprintln!("jev FAILED: {f}; its tests selected unjudged");
+                eprintln!("jev {stage} FAILED: {f}; its tests selected unjudged");
             }
         }
     }
 
+    fn count_selected(&self, reason: Reason) -> usize {
+        self.candidates.iter().filter(|c| c.reason == reason && c.selected).count()
+    }
+
     fn write_json(&self) -> Result<(), String> {
         let Some(path) = &self.cli.json else { return Ok(()) };
-        let usage = self.usage.as_ref().map(|u| {
-            json!({
-                "requests": u.requests,
-                "cache_hits": u.cache_hits,
-                "input_tokens": u.input_tokens,
-                "output_tokens": u.output_tokens,
-                "wall_ms": u.wall_ms as u64,
-                "failures": u.failures,
+        let stages: Vec<Value> = self
+            .stages
+            .iter()
+            .map(|(stage, asked, u)| {
+                json!({
+                    "stage": stage,
+                    "asked": asked,
+                    "requests": u.requests,
+                    "cache_hits": u.cache_hits,
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "wall_ms": u.wall_ms as u64,
+                    "failures": u.failures,
+                })
             })
-        });
+            .collect();
         let v = json!({
             "base": self.base,
             "head": self.head,
@@ -525,14 +622,18 @@ impl Report<'_> {
                 "module": c.test.module,
                 "name": c.test.name,
                 "reason": c.reason.as_str(),
+                "group_noul": c.group_noul,
                 "noul": c.noul,
                 "selected": c.selected,
             })).collect::<Vec<_>>(),
             "jev": {
                 "enabled": !self.cli.no_jev,
                 "threshold": self.cli.threshold,
+                "group_threshold": self.cli.group_threshold,
+                "groups": self.groups,
+                "kept_groups": self.kept_groups,
                 "error": self.jev_error,
-                "usage": usage,
+                "stages": stages,
             },
             "filter": self.expr,
             "command": if self.command.is_empty() { Value::Null } else { json!(self.command) },

@@ -59,19 +59,38 @@ fn ident_name(ident: &syn::Ident) -> String {
     }
 }
 
-/// Every test fn in a parsed file. `base` is the file's module path.
-pub fn tests_in(file: &syn::File, path: &str, base: &[String], src: &str) -> Vec<TestFn> {
+/// Every test fn in a parsed file, plus the context of each module that hosts tests:
+/// its `use` lines and the signatures of its non-test fns, structs, enums, consts and the like.
+/// `base` is the file's module path.
+pub fn tests_in(file: &syn::File, path: &str, base: &[String], src: &str) -> (Vec<TestFn>, Vec<(String, String)>) {
     let lines: Vec<&str> = src.lines().collect();
     let mut module = base.to_vec();
-    let mut out = Vec::new();
-    collect_tests(&file.items, path, &mut module, &lines, &mut out);
-    out
+    let mut tests = Vec::new();
+    let mut contexts = Vec::new();
+    collect_tests(&file.items, path, &mut module, &lines, &mut tests, &mut contexts);
+    (tests, contexts)
 }
 
-fn collect_tests(items: &[Item], path: &str, module: &mut Vec<String>, lines: &[&str], out: &mut Vec<TestFn>) {
+/// Source lines `start..=end` (1-based), each trimmed, joined by a space.
+fn snippet(lines: &[&str], start: u32, end: u32) -> String {
+    let end = (end as usize).min(lines.len());
+    lines.get(start as usize - 1..end).map(|l| l.iter().map(|s| s.trim()).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+}
+
+fn collect_tests(
+    items: &[Item],
+    path: &str,
+    module: &mut Vec<String>,
+    lines: &[&str],
+    out: &mut Vec<TestFn>,
+    contexts: &mut Vec<(String, String)>,
+) {
+    let mut context: Vec<String> = Vec::new();
+    let mut has_tests = false;
     for item in items {
         match item {
             Item::Fn(f) if is_test(&f.attrs) => {
+                has_tests = true;
                 let start = f.attrs.iter().map(|a| line(a.pound_token.span)).min().unwrap_or_else(|| line(f.sig.fn_token.span));
                 let end = end_line(f.block.brace_token.span.close());
                 let source = lines
@@ -87,15 +106,41 @@ fn collect_tests(items: &[Item], path: &str, module: &mut Vec<String>, lines: &[
                     source,
                 });
             }
+            Item::Fn(f) => {
+                // The signature's first line includes any visibility written before it.
+                let sig = f.sig.span();
+                context.push(snippet(lines, line(sig), end_line(sig)));
+            }
+            Item::Use(u) => {
+                let s = u.span();
+                context.push(snippet(lines, line(s), end_line(s)));
+            }
+            Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Const(_) | Item::Static(_) | Item::Type(_) | Item::Trait(_) => {
+                // First line of the item after its attributes: `pub struct Foo {`, `const X: u64 = 3;`.
+                let ident = match item {
+                    Item::Struct(s) => s.ident.span(),
+                    Item::Enum(e) => e.ident.span(),
+                    Item::Union(u) => u.ident.span(),
+                    Item::Const(c) => c.ident.span(),
+                    Item::Static(s) => s.ident.span(),
+                    Item::Type(t) => t.ident.span(),
+                    Item::Trait(t) => t.ident.span(),
+                    _ => unreachable!(),
+                };
+                context.push(snippet(lines, line(ident), line(ident)));
+            }
             Item::Mod(m) => {
                 if let Some((_, items)) = &m.content {
                     module.push(ident_name(&m.ident));
-                    collect_tests(items, path, module, lines, out);
+                    collect_tests(items, path, module, lines, out, contexts);
                     module.pop();
                 }
             }
             _ => {}
         }
+    }
+    if has_tests {
+        contexts.push((module.join("::"), context.join("\n")));
     }
 }
 

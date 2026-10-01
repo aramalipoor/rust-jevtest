@@ -9,10 +9,13 @@ use sha2::{Digest, Sha256};
 
 use crate::scan::TestFn;
 
-const QUESTION: &str = "Could the code change in `change` make `test` pass or fail differently than before, because `test` exercises the changed code directly or through functions, types, constants, data or behavior it depends on?";
-const CRITERIA_TRUE: &str =
+const TEST_QUESTION: &str = "Could the code change in `change` make `test` pass or fail differently than before, because `test` exercises the changed code directly or through functions, types, constants, data or behavior it depends on?";
+const TEST_TRUE: &str =
     "The test calls, constructs or depends on changed code, or on behavior the change alters, so its outcome could change.";
-const CRITERIA_FALSE: &str = "The test only exercises code that the change neither touches nor affects.";
+const TEST_FALSE: &str = "The test only exercises code that the change neither touches nor affects.";
+const GROUP_QUESTION: &str = "Could the code change in `change` make any test in `group` pass or fail differently than before, because those tests exercise the changed code directly or through functions, types, constants, data or behavior they depend on?";
+const GROUP_TRUE: &str = "The tests in the group call, construct or depend on changed code, or on behavior the change alters, so their outcome could change.";
+const GROUP_FALSE: &str = "The tests in the group only exercise code that the change neither touches nor affects.";
 const RETRY_STATUSES: [u16; 3] = [429, 503, 529];
 const ATTEMPTS: u32 = 3;
 
@@ -24,10 +27,40 @@ pub struct Client {
     cache_dir: Option<PathBuf>,
 }
 
-/// One candidate as Jev sees it.
-pub struct Question<'a> {
-    pub package: &'a str,
-    pub test: &'a TestFn,
+/// Stage-2 question: one test.
+pub fn test_question(package: &str, test: &TestFn, max_test_chars: usize) -> Value {
+    json!({
+        "type": "noul",
+        "instructions": {
+            "test": {
+                "package": package,
+                "module": test.module,
+                "name": test.name,
+                "file": test.file,
+                "source": truncate(&test.source, max_test_chars),
+            },
+            "question": TEST_QUESTION,
+        },
+        "criteria": {"true": TEST_TRUE, "false": TEST_FALSE},
+    })
+}
+
+/// Stage-1 question: every test of one (package, file, module) group.
+pub fn group_question(package: &str, file: &str, module: &str, tests: &[&str], context: &str) -> Value {
+    json!({
+        "type": "noul",
+        "instructions": {
+            "group": {
+                "package": package,
+                "file": file,
+                "module": module,
+                "tests": tests,
+                "context": context,
+            },
+            "question": GROUP_QUESTION,
+        },
+        "criteria": {"true": GROUP_TRUE, "false": GROUP_FALSE},
+    })
 }
 
 #[derive(Default)]
@@ -83,20 +116,16 @@ impl Client {
         })
     }
 
-    /// Asks one Noul per question; `None` for questions whose batch failed (unjudged).
-    pub fn judge(
-        &self,
-        state: &Value,
-        questions: &[Question],
-        batch: usize,
-        concurrency: usize,
-        max_test_chars: usize,
-    ) -> (Vec<Option<f64>>, Usage) {
+    /// Asks one Noul per question, `batch` per request; `None` for questions whose batch failed (unjudged).
+    pub fn judge(&self, state: &Value, questions: Vec<Value>, batch: usize, concurrency: usize) -> (Vec<Option<f64>>, Usage) {
         let started = Instant::now();
-        let bodies: Vec<String> = questions
-            .chunks(batch.max(1))
-            .map(|chunk| self.body(state, chunk, max_test_chars))
-            .collect();
+        let total = questions.len();
+        let mut bodies: Vec<String> = Vec::new();
+        let mut it = questions.into_iter().peekable();
+        while it.peek().is_some() {
+            let qs: Map<String, Value> = it.by_ref().take(batch.max(1)).enumerate().map(|(i, q)| (format!("t{i}"), q)).collect();
+            bodies.push(json!({"model": self.model, "state": state, "questions": qs}).to_string());
+        }
         let next = AtomicUsize::new(0);
         let mut results: Vec<Option<Batch>> = bodies.iter().map(|_| None).collect();
         std::thread::scope(|s| {
@@ -107,7 +136,7 @@ impl Client {
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(body) = bodies.get(i) else { break };
-                            let n = questions.len().min((i + 1) * batch.max(1)) - i * batch.max(1);
+                            let n = total.min((i + 1) * batch.max(1)) - i * batch.max(1);
                             done.push((i, self.ask(body, n)));
                         }
                         done
@@ -122,9 +151,9 @@ impl Client {
         });
 
         let mut usage = Usage::default();
-        let mut nouls = Vec::with_capacity(questions.len());
+        let mut nouls = Vec::with_capacity(total);
         for (i, r) in results.into_iter().enumerate() {
-            let n = questions.len().min((i + 1) * batch.max(1)) - i * batch.max(1);
+            let n = total.min((i + 1) * batch.max(1)) - i * batch.max(1);
             match r.unwrap_or_else(|| Batch::Failed("worker panicked".into())) {
                 Batch::Answered { nouls: got, cached, input_tokens, output_tokens } => {
                     if cached {
@@ -145,32 +174,6 @@ impl Client {
         }
         usage.wall_ms = started.elapsed().as_millis();
         (nouls, usage)
-    }
-
-    fn body(&self, state: &Value, chunk: &[Question], max_test_chars: usize) -> String {
-        let mut qs = Map::with_capacity(chunk.len());
-        for (i, q) in chunk.iter().enumerate() {
-            let t = q.test;
-            qs.insert(
-                format!("t{i}"),
-                json!({
-                    "type": "noul",
-                    "instructions": {
-                        "test": {
-                            "package": q.package,
-                            "module": t.module,
-                            "name": t.name,
-                            "file": t.file,
-                            "source": truncate(&t.source, max_test_chars),
-                        },
-                        "question": QUESTION,
-                    },
-                    "criteria": {"true": CRITERIA_TRUE, "false": CRITERIA_FALSE},
-                }),
-            );
-        }
-        let body = json!({"model": self.model, "state": state, "questions": qs});
-        body.to_string()
     }
 
     fn cache_path(&self, body: &str) -> Option<PathBuf> {
