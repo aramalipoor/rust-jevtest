@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="jevtest pipeline for one change across 4 crates: crate reach finds 1,717 tests, static evidence marks 22 must-run, Jev screening keeps 52 of 185 test modules, Jev judging picks 175 of 429 tests, and 197 tests run. Selection costs about $0.012 and takes under 2.5 seconds.">
+  <title>How jevtest selects tests</title>
+  <desc>jevtest pipeline for one change across 4 crates: crate reach finds 1,717 tests, static evidence marks 22 must-run, Jev screening keeps 52 of 185 test modules, Jev judging picks 175 of 429 tests, and 197 tests run. Selection costs about $0.012 and takes under 2.5 seconds.</desc>
+  <style>
+    .s{font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif}
+    .m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace}
+    .fg{fill:#F2F4F7} .mu{fill:#8B95A3} .di{fill:#566070}
+  </style>
+  <defs>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="band" gradientUnits="userSpaceOnUse" x1="64" y1="0" x2="1216" y2="0">
+      <stop offset="0" stop-color="#2DD4BF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0.30"/>
+    </linearGradient>
+    <linearGradient id="edge" gradientUnits="userSpaceOnUse" x1="64" y1="0" x2="1216" y2="0">
+      <stop offset="0" stop-color="#2DD4BF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="1279" height="419" rx="20" fill="#0B0F14" stroke="#1E2631"/>
+  <g class="s">
+    <text x="64" y="60" class="m di" font-size="13" letter-spacing="2">PIPELINE</text>
+    <text x="64" y="92" class="fg" font-size="24" font-weight="600">One change across 4 crates of a 1,717-test workspace</text>
+  </g>
+  <g>
+    <rect x="849" y="64" width="179" height="34" rx="17" fill="#121821" stroke="#253040"/>
+    <text x="867" y="86" class="m fg" font-size="16" font-weight="600">≈ $0.012</text>
+    <text x="955" y="86" class="s mu" font-size="13">Jev cost</text>
+  </g>
+  <g>
+    <rect x="1040" y="64" width="176" height="34" rx="17" fill="#121821" stroke="#253040"/>
+    <text x="1058" y="86" class="m fg" font-size="16" font-weight="600">&lt; 2.5 s</text>
+    <text x="1136" y="86" class="s mu" font-size="13">selection</text>
+  </g>
+  <path d="M74,210 L1206,248 Q1216,248 1216,258 L1216,286 Q1216,296 1206,296 L74,334 Q64,334 64,324 L64,220 Q64,210 74,210 Z" fill="url(#band)" stroke="url(#edge)" stroke-width="1.2"/>
+  <line x1="256.0" y1="222.3" x2="256.0" y2="321.7" stroke="#F2F4F7" stroke-opacity="0.14" stroke-dasharray="2 4"/>
+  <line x1="448.0" y1="228.7" x2="448.0" y2="315.3" stroke="#F2F4F7" stroke-opacity="0.14" stroke-dasharray="2 4"/>
+  <line x1="640.0" y1="235.0" x2="640.0" y2="309.0" stroke="#F2F4F7" stroke-opacity="0.14" stroke-dasharray="2 4"/>
+  <line x1="832.0" y1="241.3" x2="832.0" y2="302.7" stroke="#F2F4F7" stroke-opacity="0.14" stroke-dasharray="2 4"/>
+  <line x1="1024.0" y1="247.7" x2="1024.0" y2="296.3" stroke="#F2F4F7" stroke-opacity="0.14" stroke-dasharray="2 4"/>
+  <g class="s">
+    <text x="82" y="140" class="m" font-size="12" fill="#2DD4BF" letter-spacing="1">01</text>
+    <text x="82" y="164" class="fg" font-size="17" font-weight="600">Diff</text>
+    <text x="82" y="184" class="mu" font-size="13">What changed</text>
+    <text x="160" y="282" text-anchor="middle" class="m fg" font-size="28" font-weight="700">4</text>
+    <text x="82" y="360" class="mu" font-size="13">crates changed</text>
+    <text x="274" y="140" class="m" font-size="12" fill="#2DD4BF" letter-spacing="1">02</text>
+    <text x="274" y="164" class="fg" font-size="17" font-weight="600">Crate reach</text>
+    <text x="274" y="184" class="mu" font-size="13">Reverse dependencies</text>
+    <text x="352" y="282" text-anchor="middle" class="m fg" font-size="28" font-weight="700">1,717</text>
+    <text x="274" y="360" class="mu" font-size="13">tests in 25 crates</text>
+    <text x="466" y="140" class="m" font-size="12" fill="#2DD4BF" letter-spacing="1">03</text>
+    <text x="466" y="164" class="fg" font-size="17" font-weight="600">Static evidence</text>
+    <text x="466" y="184" class="mu" font-size="13">Diff touches test</text>
+    <text x="544" y="282" text-anchor="middle" class="m fg" font-size="28" font-weight="700">22</text>
+    <text x="466" y="360" class="mu" font-size="13">must-run tests</text>
+    <text x="658" y="140" class="m" font-size="12" fill="#8B5CF6" letter-spacing="1">04  JEV</text>
+    <text x="658" y="164" class="fg" font-size="17" font-weight="600">Jev screening</text>
+    <text x="658" y="184" class="mu" font-size="13">Score test modules</text>
+    <text x="736" y="282" text-anchor="middle" class="m" font-size="28" font-weight="700"><tspan class="di" font-size="18" font-weight="500">185 → </tspan><tspan class="fg">52</tspan></text>
+    <text x="658" y="360" class="mu" font-size="13">modules kept of 185</text>
+    <text x="850" y="140" class="m" font-size="12" fill="#8B5CF6" letter-spacing="1">05  JEV</text>
+    <text x="850" y="164" class="fg" font-size="17" font-weight="600">Jev judging</text>
+    <text x="850" y="184" class="mu" font-size="13">Score each test</text>
+    <text x="928" y="282" text-anchor="middle" class="m" font-size="28" font-weight="700"><tspan class="di" font-size="18" font-weight="500">429 → </tspan><tspan class="fg">175</tspan></text>
+    <text x="850" y="360" class="mu" font-size="13">picked of 429 judged</text>
+    <text x="1042" y="140" class="m" font-size="12" fill="#2DD4BF" letter-spacing="1">06</text>
+    <text x="1042" y="164" class="fg" font-size="17" font-weight="600">Run</text>
+    <text x="1042" y="184" class="mu" font-size="13">One nextest command</text>
+    <text x="1120" y="282" text-anchor="middle" class="m fg" font-size="28" font-weight="700">197</text>
+    <text x="1042" y="360" class="mu" font-size="13">tests run (22 + 175)</text>
+  </g>
+  <line x1="64" x2="1216" y1="372" y2="372" stroke="#1E2631"/>
+  <text x="64" y="398" class="s di" font-size="13">1,259 tests screened out at module level  ·  197 of 1,717 run (−89%)  ·  Jev: $0.042 per million input tokens</text>
+</svg>

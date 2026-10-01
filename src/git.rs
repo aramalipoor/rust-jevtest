@@ -48,6 +48,8 @@ pub enum Status {
     Modified,
     Deleted,
     Renamed,
+    /// Not known to git; counts as added (working-tree mode, `include_untracked`).
+    Untracked,
 }
 
 impl Status {
@@ -57,6 +59,28 @@ impl Status {
             Status::Modified => "modified",
             Status::Deleted => "deleted",
             Status::Renamed => "renamed",
+            Status::Untracked => "untracked",
+        }
+    }
+}
+
+/// What the base is compared against.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// The working tree (tracked changes, plus untracked `.rs` files when enabled).
+    Worktree,
+    /// The index (`--staged`).
+    Staged,
+    /// A revision (`--head`).
+    Rev(String),
+}
+
+impl Target {
+    pub fn label(&self) -> &str {
+        match self {
+            Target::Worktree => "working tree",
+            Target::Staged => "index",
+            Target::Rev(r) => r,
         }
     }
 }
@@ -93,23 +117,40 @@ const DIFF_FLAGS: [&str; 6] = [
     "--no-relative",
 ];
 
-fn diff_args<'a>(extra: &[&'a str], base: &'a str, head: Option<&'a str>) -> Vec<&'a str> {
+fn diff_args<'a>(extra: &[&'a str], base: &'a str, target: &'a Target) -> Vec<&'a str> {
     let mut args = vec!["-c", "core.quotePath=false", "diff"];
     args.extend_from_slice(&DIFF_FLAGS);
     args.extend_from_slice(extra);
-    args.push(base);
-    args.extend(head);
+    match target {
+        Target::Worktree => args.push(base),
+        Target::Staged => args.extend(["--cached", base]),
+        Target::Rev(head) => args.extend([base, head.as_str()]),
+    }
     args.push("--");
     args
 }
 
-/// The `-U5` diff text handed to Jev.
-pub fn context_diff(root: &Path, base: &str, head: Option<&str>) -> Result<String, String> {
-    git(root, &diff_args(&["-U5"], base, head))
+/// The `-U5` diff text handed to Jev; untracked files are appended as whole-file additions.
+pub fn context_diff(root: &Path, base: &str, target: &Target, files: &[FileChange], source: &mut Source) -> Result<String, String> {
+    let mut diff = git(root, &diff_args(&["-U5"], base, target))?;
+    for f in files.iter().filter(|f| f.status == Status::Untracked) {
+        let path = f.path();
+        let Some(text) = source.read(path) else { continue };
+        let n = text.lines().count();
+        diff.push_str(&format!("diff --git a/{path} b/{path}\nnew file (untracked)\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n"));
+        for line in text.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+    Ok(diff)
 }
 
-pub fn changed_files(root: &Path, base: &str, head: Option<&str>) -> Result<Vec<FileChange>, String> {
-    let names = git(root, &diff_args(&["--name-status", "-z"], base, head))?;
+/// Changed files between `base` and `target`; with `untracked`, untracked `.rs` files of the
+/// working tree are added as [`Status::Untracked`] covering every line.
+pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) -> Result<Vec<FileChange>, String> {
+    let names = git(root, &diff_args(&["--name-status", "-z"], base, target))?;
     let mut files = Vec::new();
     let mut fields = names.split('\0').filter(|s| !s.is_empty());
     while let Some(code) = fields.next() {
@@ -137,11 +178,25 @@ pub fn changed_files(root: &Path, base: &str, head: Option<&str>) -> Result<Vec<
         files.push(FileChange { old_path, new_path, status, new_ranges: Vec::new(), old_ranges: Vec::new() });
     }
 
-    let hunks = parse_hunks(&git(root, &diff_args(&["-U0"], base, head))?);
+    let hunks = parse_hunks(&git(root, &diff_args(&["-U0"], base, target))?);
     for f in &mut files {
         if let Some((old, new)) = hunks.get(f.path()) {
             f.old_ranges.clone_from(old);
             f.new_ranges.clone_from(new);
+        }
+    }
+
+    if untracked && matches!(target, Target::Worktree) {
+        let list = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        for path in list.split('\0').filter(|p| p.ends_with(".rs")) {
+            let lines = std::fs::read_to_string(root.join(path)).map(|t| t.lines().count()).unwrap_or(0).max(1) as u32;
+            files.push(FileChange {
+                old_path: None,
+                new_path: Some(path.to_owned()),
+                status: Status::Untracked,
+                new_ranges: vec![(1, lines)],
+                old_ranges: Vec::new(),
+            });
         }
     }
     Ok(files)
@@ -239,8 +294,18 @@ pub enum Source {
 }
 
 impl Source {
-    pub fn new(root: &Path, head: Option<&str>) -> Result<Self, String> {
-        let Some(rev) = head else { return Ok(Source::Disk(root.to_owned())) };
+    /// Reads the side `target` names: disk, the index, or a revision.
+    pub fn new(root: &Path, target: &Target) -> Result<Self, String> {
+        match target {
+            Target::Worktree => Ok(Source::Disk(root.to_owned())),
+            // `:path` names the staged blob.
+            Target::Staged => Self::at(root, ""),
+            Target::Rev(rev) => Self::at(root, rev),
+        }
+    }
+
+    /// Reads files at revision `rev` (`""` = the index).
+    pub fn at(root: &Path, rev: &str) -> Result<Self, String> {
         let mut child = Command::new("git")
             .arg("-C")
             .arg(root)
@@ -287,7 +352,11 @@ impl Source {
                 Ok(out)
             }
             Source::Rev { rev, .. } => {
-                let mut args = vec!["ls-tree", "-r", "--name-only", "-z", rev.as_str()];
+                let mut args = if rev.is_empty() {
+                    vec!["ls-files", "-z"]
+                } else {
+                    vec!["ls-tree", "-r", "--name-only", "-z", rev.as_str()]
+                };
                 if !dir.is_empty() {
                     args.extend(["--", dir]);
                 }

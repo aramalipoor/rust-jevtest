@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="jevtest: run only the Rust tests your change can break.">
+  <title>jevtest</title>
+  <desc>jevtest: run only the Rust tests your change can break.</desc>
+  <style>
+    .s{font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif}
+    .m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace}
+    .fg{fill:#F2F4F7} .mu{fill:#8B95A3} .di{fill:#566070}
+  </style>
+  <defs>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="lat" gradientUnits="userSpaceOnUse" x1="700" y1="0" x2="1200" y2="0">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="1279" height="319" rx="20" fill="#0B0F14" stroke="#1E2631"/>
+  <g class="s">
+    <text x="88" y="104" class="m di" font-size="15" letter-spacing="2">CARGO JEVTEST</text>
+    <text x="84" y="190" class="fg" font-size="96" font-weight="700" letter-spacing="-3">jevtest</text>
+    <rect x="90" y="214" width="56" height="4" rx="2" fill="url(#acc)"/>
+    <text x="88" y="258" class="mu" font-size="26">Run only the Rust tests your change can break.</text>
+  </g>
+  <g>
+    <circle cx="744" cy="72" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="94" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="116" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="138" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="160" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="182" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="204" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="226" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="744" cy="248" r="2.6" fill="url(#lat)" opacity="0.75"/>
+    <circle cx="782" cy="72" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="94" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="116" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="138" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="160" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="182" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="204" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="226" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="782" cy="248" r="2.6" fill="url(#lat)" opacity="0.73"/>
+    <circle cx="820" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="820" cy="94" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="116" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="138" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="160" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="182" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="204" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="226" r="2.6" fill="url(#lat)" opacity="0.70"/>
+    <circle cx="820" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="858" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="858" cy="116" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="138" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="160" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="182" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="204" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="226" r="2.6" fill="url(#lat)" opacity="0.68"/>
+    <circle cx="858" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="896" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="896" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="896" cy="116" r="2.6" fill="url(#lat)" opacity="0.66"/>
+    <circle cx="896" cy="138" r="2.6" fill="url(#lat)" opacity="0.66"/>
+    <circle cx="896" cy="160" r="2.6" fill="url(#lat)" opacity="0.66"/>
+    <circle cx="896" cy="182" r="2.6" fill="url(#lat)" opacity="0.66"/>
+    <circle cx="896" cy="204" r="2.6" fill="url(#lat)" opacity="0.66"/>
+    <circle cx="896" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="896" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="934" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="934" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="934" cy="116" r="2.6" fill="url(#lat)" opacity="0.64"/>
+    <circle cx="934" cy="138" r="2.6" fill="url(#lat)" opacity="0.64"/>
+    <circle cx="934" cy="160" r="2.6" fill="url(#lat)" opacity="0.64"/>
+    <circle cx="934" cy="182" r="2.6" fill="url(#lat)" opacity="0.64"/>
+    <circle cx="934" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="934" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="138" r="2.6" fill="url(#lat)" opacity="0.61"/>
+    <circle cx="972" cy="160" r="2.6" fill="url(#lat)" opacity="0.61"/>
+    <circle cx="972" cy="182" r="2.6" fill="url(#lat)" opacity="0.61"/>
+    <circle cx="972" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="972" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="160" r="2.6" fill="url(#lat)" opacity="0.59"/>
+    <circle cx="1010" cy="182" r="2.6" fill="url(#lat)" opacity="0.59"/>
+    <circle cx="1010" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="1010" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="138" r="2.6" fill="url(#lat)" opacity="0.57"/>
+    <circle cx="1048" cy="160" r="2.6" fill="url(#lat)" opacity="0.57"/>
+    <circle cx="1048" cy="182" r="2.6" fill="url(#lat)" opacity="0.57"/>
+    <circle cx="1048" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="1048" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="138" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="182" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="1086" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="138" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="160" r="2.6" fill="url(#lat)" opacity="0.52"/>
+    <circle cx="1124" cy="182" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="1124" cy="248" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="72" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="94" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="116" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="138" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="182" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="204" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="226" r="1.8" fill="#1A222B"/>
+    <circle cx="1162" cy="248" r="1.8" fill="#1A222B"/>
+  </g>
+  <circle cx="1162" cy="160" r="64" fill="url(#glow)"/>
+  <g fill="url(#lat)">
+    <circle cx="858" cy="94" r="3.6"/>
+    <circle cx="934" cy="204" r="4.2"/>
+    <circle cx="1010" cy="138" r="4.8"/>
+    <circle cx="1086" cy="160" r="5.4"/>
+    <circle cx="1162" cy="160" r="6.5"/>
+  </g>
+</svg>

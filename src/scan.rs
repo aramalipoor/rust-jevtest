@@ -144,27 +144,32 @@ fn collect_tests(
     }
 }
 
-struct Named {
-    path: String,
+/// A named item and its line span.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Named {
+    /// `module::Type::method`, for display.
+    pub path: String,
+    /// Last segment without `!` (`next_at`, `Store`, `my_macro`).
+    pub name: String,
+    /// The impl or trait type a method, const or associated type belongs to.
+    pub owner: Option<String>,
+    /// A test fn or an inline module: shown, but never a changed item for static evidence.
+    pub container_or_test: bool,
     start: u32,
     end: u32,
 }
 
-/// The innermost named item enclosing each line, as `module::item` paths (deduplicated, in line order).
-/// Lines outside every item yield `None` entries collapsed into a single `None`.
-pub fn symbols_at(file: &syn::File, base: &[String], lines: &[u32]) -> Vec<Option<String>> {
+/// The innermost named item enclosing each line of `ranges` (deduplicated, in line order).
+/// Lines outside every item yield a single `None`.
+pub fn items_at(file: &syn::File, base: &[String], ranges: &[(u32, u32)]) -> Vec<Option<Named>> {
     let mut named = Vec::new();
     let mut module = base.to_vec();
     collect_named(&file.items, &mut module, &mut named);
-    let mut out: Vec<Option<String>> = Vec::new();
-    for &l in lines {
-        let found = named
-            .iter()
-            .filter(|n| n.start <= l && l <= n.end)
-            .min_by_key(|n| n.end - n.start)
-            .map(|n| n.path.clone());
-        if !out.contains(&found) {
-            out.push(found);
+    let mut out: Vec<Option<Named>> = Vec::new();
+    for l in ranges.iter().flat_map(|&(a, b)| a..=b) {
+        let found = named.iter().filter(|n| n.start <= l && l <= n.end).min_by_key(|n| n.end - n.start);
+        if !out.iter().any(|o| o.as_ref() == found) {
+            out.push(found.cloned());
         }
     }
     out
@@ -187,28 +192,39 @@ fn self_type_name(ty: &Type) -> String {
 }
 
 fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>) {
-    let push = |out: &mut Vec<Named>, module: &[String], name: String, span: Span| {
-        out.push(Named { path: qualified(module, &name), start: line(span), end: end_line(span) });
+    let push = |out: &mut Vec<Named>, module: &[String], owner: Option<&str>, name: String, span: Span, special: bool| {
+        let shown = match owner {
+            Some(o) => format!("{o}::{name}"),
+            None => name.clone(),
+        };
+        out.push(Named {
+            path: qualified(module, &shown),
+            name: name.trim_end_matches('!').to_owned(),
+            owner: owner.map(str::to_owned),
+            container_or_test: special,
+            start: line(span),
+            end: end_line(span),
+        });
     };
     for item in items {
         match item {
-            Item::Fn(f) => push(out, module, ident_name(&f.sig.ident), f.span()),
-            Item::Struct(s) => push(out, module, ident_name(&s.ident), s.span()),
-            Item::Enum(e) => push(out, module, ident_name(&e.ident), e.span()),
-            Item::Union(u) => push(out, module, ident_name(&u.ident), u.span()),
-            Item::Const(c) => push(out, module, ident_name(&c.ident), c.span()),
-            Item::Static(s) => push(out, module, ident_name(&s.ident), s.span()),
-            Item::Type(t) => push(out, module, ident_name(&t.ident), t.span()),
+            Item::Fn(f) => push(out, module, None, ident_name(&f.sig.ident), f.span(), is_test(&f.attrs)),
+            Item::Struct(s) => push(out, module, None, ident_name(&s.ident), s.span(), false),
+            Item::Enum(e) => push(out, module, None, ident_name(&e.ident), e.span(), false),
+            Item::Union(u) => push(out, module, None, ident_name(&u.ident), u.span(), false),
+            Item::Const(c) => push(out, module, None, ident_name(&c.ident), c.span(), false),
+            Item::Static(s) => push(out, module, None, ident_name(&s.ident), s.span(), false),
+            Item::Type(t) => push(out, module, None, ident_name(&t.ident), t.span(), false),
             Item::Macro(m) => {
                 if let Some(ident) = &m.ident
                     && m.mac.path.is_ident("macro_rules")
                 {
-                    push(out, module, format!("{}!", ident_name(ident)), m.span());
+                    push(out, module, None, format!("{}!", ident_name(ident)), m.span(), false);
                 }
             }
             Item::Trait(t) => {
                 let tn = ident_name(&t.ident);
-                push(out, module, tn.clone(), t.span());
+                push(out, module, None, tn.clone(), t.span(), false);
                 for ti in &t.items {
                     let (name, span) = match ti {
                         TraitItem::Fn(f) => (&f.sig.ident, f.span()),
@@ -216,12 +232,12 @@ fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>)
                         TraitItem::Type(ty) => (&ty.ident, ty.span()),
                         _ => continue,
                     };
-                    push(out, module, format!("{tn}::{}", ident_name(name)), span);
+                    push(out, module, Some(&tn), ident_name(name), span, false);
                 }
             }
             Item::Impl(imp) => {
                 let tn = self_type_name(&imp.self_ty);
-                push(out, module, tn.clone(), imp.span());
+                push(out, module, None, tn.clone(), imp.span(), false);
                 for ii in &imp.items {
                     let (name, span) = match ii {
                         ImplItem::Fn(f) => (&f.sig.ident, f.span()),
@@ -229,14 +245,21 @@ fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>)
                         ImplItem::Type(ty) => (&ty.ident, ty.span()),
                         _ => continue,
                     };
-                    push(out, module, format!("{tn}::{}", ident_name(name)), span);
+                    push(out, module, Some(&tn), ident_name(name), span, false);
                 }
             }
             Item::Mod(m) => {
                 let name = ident_name(&m.ident);
                 if let Some((brace, items)) = &m.content {
                     let start = m.attrs.iter().map(|a| line(a.pound_token.span)).chain([line(m.mod_token.span)]).min().unwrap_or(0);
-                    out.push(Named { path: qualified(module, &name), start, end: end_line(brace.span.close()) });
+                    out.push(Named {
+                        path: qualified(module, &name),
+                        name: name.clone(),
+                        owner: None,
+                        container_or_test: true,
+                        start,
+                        end: end_line(brace.span.close()),
+                    });
                     module.push(name);
                     collect_named(items, module, out);
                     module.pop();

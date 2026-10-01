@@ -97,9 +97,14 @@ impl Workspace {
             .map(|(i, _)| i)
     }
 
-    /// Changed packages (in the given order) followed by their transitive reverse deps, nearest first.
+    pub fn by_name(&self, name: &str) -> Option<usize> {
+        self.packages.iter().position(|p| p.name == name)
+    }
+
+    /// Changed packages (in the given order) followed by their reverse deps (normal, dev and build),
+    /// nearest first, at most `max_depth` hops away (0 = no limit).
     /// Returns (package, distance) with distance 0 for changed packages.
-    pub fn affected(&self, changed: &[usize]) -> Vec<(usize, u32)> {
+    pub fn affected(&self, changed: &[usize], max_depth: usize) -> Vec<(usize, u32)> {
         let mut dist: Vec<Option<u32>> = vec![None; self.packages.len()];
         let mut queue = VecDeque::new();
         let mut order = Vec::new();
@@ -112,6 +117,9 @@ impl Workspace {
         }
         while let Some(p) = queue.pop_front() {
             let d = dist[p].unwrap_or(0) + 1;
+            if max_depth != 0 && d as usize > max_depth {
+                continue;
+            }
             let mut next: Vec<usize> = self.rdeps[p].iter().copied().filter(|&r| dist[r].is_none()).collect();
             next.sort_unstable_by(|&a, &b| self.packages[a].name.cmp(&self.packages[b].name));
             for r in next {

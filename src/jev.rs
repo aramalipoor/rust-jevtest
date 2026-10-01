@@ -1,6 +1,7 @@
 //! Batched, cached, concurrent TypeSafe Jev (System One) Noul calls.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -13,22 +14,42 @@ const TEST_QUESTION: &str = "Could the code change in `change` make `test` pass 
 const TEST_TRUE: &str =
     "The test calls, constructs or depends on changed code, or on behavior the change alters, so its outcome could change.";
 const TEST_FALSE: &str = "The test only exercises code that the change neither touches nor affects.";
+const NAMES_QUESTION: &str = "Judging from where `test` lives and what it is called, could the code change in `change` make `test` pass or fail differently than before, because `test` likely exercises the changed code directly or through functions, types, constants, data or behavior it depends on?";
 const GROUP_QUESTION: &str = "Could the code change in `change` make any test in `group` pass or fail differently than before, because those tests exercise the changed code directly or through functions, types, constants, data or behavior they depend on?";
 const GROUP_TRUE: &str = "The tests in the group call, construct or depend on changed code, or on behavior the change alters, so their outcome could change.";
 const GROUP_FALSE: &str = "The tests in the group only exercise code that the change neither touches nor affects.";
 const RETRY_STATUSES: [u16; 3] = [429, 503, 529];
 const ATTEMPTS: u32 = 3;
+/// Price per input token (output is free).
+pub const USD_PER_INPUT_TOKEN: f64 = 0.042 / 1_000_000.0;
 
 pub struct Client {
     url: String,
-    key: String,
+    /// `None` = offline: answers come from the cache only.
+    key: Option<String>,
     model: String,
     agent: ureq::Agent,
-    cache_dir: Option<PathBuf>,
+    cache_dir: PathBuf,
+    /// Every request (retries included) ends by then: Jev never blocks past `jev.timeout_secs`.
+    deadline: Instant,
+    /// The first failure; later requests fail at once with it.
+    dead: Mutex<Option<String>>,
 }
 
-/// Stage-2 question: one test.
-pub fn test_question(package: &str, test: &TestFn, max_test_chars: usize) -> Value {
+/// Stage-2 `names` view: the test's identity only.
+pub fn names_question(package: &str, test: &TestFn) -> Value {
+    json!({
+        "type": "noul",
+        "instructions": {
+            "test": {"package": package, "module": test.module, "name": test.name, "file": test.file},
+            "question": NAMES_QUESTION,
+        },
+        "criteria": {"true": TEST_TRUE, "false": TEST_FALSE},
+    })
+}
+
+/// Stage-2 `body` view: the test's source.
+pub fn body_question(package: &str, test: &TestFn, max_test_chars: usize) -> Value {
     json!({
         "type": "noul",
         "instructions": {
@@ -45,7 +66,7 @@ pub fn test_question(package: &str, test: &TestFn, max_test_chars: usize) -> Val
     })
 }
 
-/// Stage-1 question: every test of one (package, file, module) group.
+/// Stage-1 screening question: every test of one (package, file, module) group.
 pub fn group_question(package: &str, file: &str, module: &str, tests: &[&str], context: &str) -> Value {
     json!({
         "type": "noul",
@@ -65,10 +86,13 @@ pub fn group_question(package: &str, file: &str, module: &str, tests: &[&str], c
 
 #[derive(Default)]
 pub struct Usage {
+    pub asked: usize,
     pub requests: u32,
     pub cache_hits: u32,
     /// Requests rejected as too large and retried as two halves.
     pub splits: u32,
+    /// Offline: questions whose answer was not cached.
+    pub uncached: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub wall_ms: u128,
@@ -80,9 +104,14 @@ impl Usage {
         self.requests += other.requests;
         self.cache_hits += other.cache_hits;
         self.splits += other.splits;
+        self.uncached += other.uncached;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.failures.extend(other.failures);
+    }
+
+    pub fn est_cost_usd(&self) -> f64 {
+        self.input_tokens as f64 * USD_PER_INPUT_TOKEN
     }
 }
 
@@ -90,54 +119,57 @@ enum Batch {
     Answered { nouls: Vec<f64>, cached: bool, input_tokens: u64, output_tokens: u64 },
     /// The API refused the request size (`max_tokens_exceeded`, 413 or 422).
     TooLarge { detail: String, cached: bool },
+    /// Offline and not cached.
+    Uncached,
     Failed(String),
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+/// One question's outcome.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Answer {
+    Noul(f64),
+    /// The request failed (after retries) or its answer was malformed.
+    Failed,
+    /// Offline and not in the cache.
+    Uncached,
+}
+
+/// A request's answer and cost, for `doctor`.
+pub struct Ping {
+    pub noul: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub ms: u128,
 }
 
 impl Client {
-    pub fn from_env() -> Result<Self, String> {
-        let key = match std::env::var("TYPESAFE_API_KEY") {
-            Ok(k) if !k.trim().is_empty() => k.trim().to_owned(),
-            _ => {
-                let path = home().ok_or("HOME is unset")?.join(".config/jevtest/typesafe.key");
-                std::fs::read_to_string(&path)
-                    .map_err(|e| format!("no TYPESAFE_API_KEY and cannot read {}: {e}", path.display()))?
-                    .trim()
-                    .to_owned()
-            }
-        };
-        if key.is_empty() {
-            return Err("TypeSafe API key is empty".into());
-        }
-        let base = std::env::var("TYPESAFE_BASE_URL").unwrap_or_else(|_| "https://api.typesafe.ai/v1".into());
-        let model = std::env::var("TYPESAFE_MODEL").unwrap_or_else(|_| "jev-latest".into());
+    /// `key` = `None` makes the client offline (cache only). Every request this client makes,
+    /// retries included, ends within `timeout_secs` of its creation.
+    pub fn new(base_url: &str, model: &str, key: Option<String>, timeout_secs: u64, cache_dir: &Path) -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(300)))
+            .timeout_global(Some(Duration::from_secs(timeout_secs)))
             .build();
-        let cache_dir = home().map(|h| h.join(".cache/jevtest"));
-        if let Some(dir) = &cache_dir {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        Ok(Client {
-            url: format!("{}/systemone", base.trim_end_matches('/')),
+        let _ = std::fs::create_dir_all(cache_dir);
+        Client {
+            url: format!("{}/systemone", base_url.trim_end_matches('/')),
             key,
-            model,
+            model: model.to_owned(),
             agent: ureq::Agent::new_with_config(config),
-            cache_dir,
-        })
+            cache_dir: cache_dir.to_owned(),
+            deadline: Instant::now() + Duration::from_secs(timeout_secs),
+            dead: Mutex::new(None),
+        }
     }
 
-    /// Asks one Noul per question, up to `batch` per request; `None` for questions whose batch failed (unjudged).
-    /// A request the API refuses as too large is retried as two halves, recursively.
-    pub fn judge(&self, state: &Value, questions: Vec<Value>, batch: usize, concurrency: usize) -> (Vec<Option<f64>>, Usage) {
+    /// Asks one Noul per question, up to `batch` per request. A request the API refuses as too
+    /// large is retried as two halves, recursively. After the first failed request every later
+    /// one fails at once with the same cause (any failure sends selection to `on_jev_error`).
+    pub fn judge(&self, state: &Value, questions: &[Value], batch: usize, concurrency: usize) -> (Vec<Answer>, Usage) {
         let started = Instant::now();
         let chunks: Vec<&[Value]> = questions.chunks(batch.max(1)).collect();
         let next = AtomicUsize::new(0);
-        let mut results: Vec<Option<(Vec<Option<f64>>, Usage)>> = chunks.iter().map(|_| None).collect();
+        let mut results: Vec<Option<(Vec<Answer>, Usage)>> = chunks.iter().map(|_| None).collect();
         std::thread::scope(|s| {
             let workers: Vec<_> = (0..concurrency.clamp(1, chunks.len().max(1)))
                 .map(|_| {
@@ -161,7 +193,7 @@ impl Client {
             }
         });
 
-        let mut usage = Usage::default();
+        let mut usage = Usage { asked: questions.len(), ..Usage::default() };
         let mut nouls = Vec::with_capacity(questions.len());
         for (i, r) in results.into_iter().enumerate() {
             match r {
@@ -171,7 +203,7 @@ impl Client {
                 }
                 None => {
                     usage.failures.push(format!("batch {i}: worker panicked"));
-                    nouls.extend(std::iter::repeat_n(None, chunks[i].len()));
+                    nouls.extend(std::iter::repeat_n(Answer::Failed, chunks[i].len()));
                 }
             }
         }
@@ -179,10 +211,14 @@ impl Client {
         (nouls, usage)
     }
 
-    fn ask_split(&self, state: &Value, qs: &[Value], usage: &mut Usage) -> Vec<Option<f64>> {
+    fn body(&self, state: &Value, qs: &[Value]) -> String {
         let questions: Map<String, Value> = qs.iter().enumerate().map(|(i, q)| (format!("t{i}"), q.clone())).collect();
-        let body = json!({"model": self.model, "state": state, "questions": questions}).to_string();
-        match self.ask(&body, qs.len()) {
+        json!({"model": self.model, "state": state, "questions": questions}).to_string()
+    }
+
+    fn ask_split(&self, state: &Value, qs: &[Value], usage: &mut Usage) -> Vec<Answer> {
+        let body = self.body(state, qs);
+        match self.ask(&body, qs.len(), true) {
             Batch::Answered { nouls, cached, input_tokens, output_tokens } => {
                 if cached {
                     usage.cache_hits += 1;
@@ -191,7 +227,7 @@ impl Client {
                     usage.input_tokens += input_tokens;
                     usage.output_tokens += output_tokens;
                 }
-                nouls.into_iter().map(Some).collect()
+                nouls.into_iter().map(Answer::Noul).collect()
             }
             Batch::TooLarge { cached, .. } if qs.len() > 1 => {
                 if cached {
@@ -205,57 +241,82 @@ impl Client {
                 let (mut nouls, rest) = std::thread::scope(|s| {
                     let first = s.spawn(|| self.ask_split(state, a, &mut ua));
                     let rest = self.ask_split(state, b, &mut ub);
-                    (first.join().unwrap_or_else(|_| vec![None; a.len()]), rest)
+                    (first.join().unwrap_or_else(|_| vec![Answer::Failed; a.len()]), rest)
                 });
                 usage.add(ua);
                 usage.add(ub);
                 nouls.extend(rest);
                 nouls
             }
+            Batch::Uncached => {
+                usage.uncached += qs.len();
+                vec![Answer::Uncached; qs.len()]
+            }
             Batch::TooLarge { detail: why, .. } | Batch::Failed(why) => {
                 usage.requests += 1;
-                usage.failures.push(format!("{} questions: {why}", qs.len()));
-                vec![None; qs.len()]
+                usage.failures.push(why);
+                vec![Answer::Failed; qs.len()]
             }
         }
     }
 
-    fn cache_path(&self, body: &str) -> Option<PathBuf> {
+    fn cache_path(&self, body: &str) -> PathBuf {
         let digest = Sha256::digest(body.as_bytes());
         let mut hex = String::with_capacity(64);
         for b in digest.iter() {
             use std::fmt::Write;
             let _ = write!(hex, "{b:02x}");
         }
-        self.cache_dir.as_ref().map(|d| d.join(format!("{hex}.json")))
+        self.cache_dir.join(format!("{hex}.json"))
     }
 
-    fn ask(&self, body: &str, n: usize) -> Batch {
+    fn ask(&self, body: &str, n: usize, use_cache: bool) -> Batch {
         let cache = self.cache_path(body);
-        if let Some(path) = &cache
-            && let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(Batch::Answered { nouls, input_tokens, output_tokens, .. }) = parse(&text, n)
-        {
-            return Batch::Answered { nouls, cached: true, input_tokens, output_tokens };
-        }
         // A size refusal is cached too, so reruns split straight away without a network call.
-        let refusal = cache.as_ref().map(|p| p.with_extension("too-large"));
-        if let Some(path) = &refusal
-            && let Ok(detail) = std::fs::read_to_string(path)
-        {
-            return Batch::TooLarge { detail, cached: true };
+        let refusal = cache.with_extension("too-large");
+        if use_cache {
+            if let Ok(text) = std::fs::read_to_string(&cache)
+                && let Ok(Batch::Answered { nouls, input_tokens, output_tokens, .. }) = parse(&text, n)
+            {
+                return Batch::Answered { nouls, cached: true, input_tokens, output_tokens };
+            }
+            if let Ok(detail) = std::fs::read_to_string(&refusal) {
+                return Batch::TooLarge { detail, cached: true };
+            }
         }
+        let Some(key) = &self.key else { return Batch::Uncached };
+        if let Some(why) = self.dead.lock().ok().and_then(|d| d.clone()) {
+            return Batch::Failed(why);
+        }
+        let batch = self.post(key, body, n, &cache, &refusal);
+        if let Batch::Failed(why) = &batch
+            && let Ok(mut dead) = self.dead.lock()
+        {
+            dead.get_or_insert_with(|| why.clone());
+        }
+        batch
+    }
+
+    fn post(&self, key: &str, body: &str, n: usize, cache: &Path, refusal: &Path) -> Batch {
         let mut attempt = 0;
         let text = loop {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Batch::Failed("timed out (jev.timeout_secs)".into());
+            }
             let sent = self
                 .agent
                 .post(&self.url)
-                .header("Authorization", format!("Bearer {}", self.key))
+                .config()
+                .timeout_global(Some(left))
+                .build()
+                .header("Authorization", format!("Bearer {key}"))
                 .content_type("application/json")
                 .send(body.as_bytes());
             let mut resp = match sent {
                 Ok(r) => r,
-                Err(e) => return Batch::Failed(format!("request failed: {e}")),
+                Err(ureq::Error::Timeout(_)) => return Batch::Failed("timed out (jev.timeout_secs)".into()),
+                Err(e) => return Batch::Failed(format!("cannot reach {}: {e}", self.url)),
             };
             let status = resp.status().as_u16();
             let text = resp.body_mut().read_to_string().unwrap_or_default();
@@ -263,31 +324,53 @@ impl Client {
                 break text;
             }
             attempt += 1;
-            let detail = format!("HTTP {status}: {}", truncate(text.trim(), 300));
+            let what = match status {
+                401 | 403 => " (API key rejected)",
+                402 => " (out of credits)",
+                500..=599 => " (server error)",
+                _ => "",
+            };
+            let detail = format!("HTTP {status}{what}: {}", truncate(text.trim(), 200));
             if status == 413 || status == 422 || (status == 400 && text.contains("max_tokens_exceeded")) {
-                if let Some(path) = &refusal {
-                    write_atomic(path, &detail);
-                }
+                write_atomic(refusal, &detail);
                 return Batch::TooLarge { detail, cached: false };
             }
-            if !RETRY_STATUSES.contains(&status) || attempt >= ATTEMPTS {
+            let pause = Duration::from_millis(500 << (attempt - 1));
+            let retry = RETRY_STATUSES.contains(&status) && attempt < ATTEMPTS && Instant::now() + pause < self.deadline;
+            if !retry {
                 return Batch::Failed(detail);
             }
-            std::thread::sleep(Duration::from_millis(500 << (attempt - 1)));
+            std::thread::sleep(pause);
         };
         match parse(&text, n) {
             Ok(answered) => {
-                if let Some(path) = &cache {
-                    write_atomic(path, &text);
-                }
+                write_atomic(cache, &text);
                 answered
             }
-            Err(why) => Batch::Failed(why),
+            Err(why) => Batch::Failed(format!("malformed answer: {why}")),
+        }
+    }
+
+    /// One tiny uncached question, for `doctor`.
+    pub fn ping(&self) -> Result<Ping, String> {
+        let state = json!({"change": {"diff": "-fn add(a: i32, b: i32) -> i32 { a + b }\n+fn add(a: i32, b: i32) -> i32 { a - b }"}});
+        let question = json!({
+            "type": "noul",
+            "instructions": {"test": {"name": "adds_two_numbers", "source": "assert_eq!(add(2, 2), 4);"}, "question": TEST_QUESTION},
+            "criteria": {"true": TEST_TRUE, "false": TEST_FALSE},
+        });
+        let started = Instant::now();
+        match self.ask(&self.body(&state, &[question]), 1, false) {
+            Batch::Answered { nouls, input_tokens, output_tokens, .. } => {
+                Ok(Ping { noul: nouls[0], input_tokens, output_tokens, ms: started.elapsed().as_millis() })
+            }
+            Batch::TooLarge { detail, .. } | Batch::Failed(detail) => Err(detail),
+            Batch::Uncached => Err("no API key".into()),
         }
     }
 }
 
-fn write_atomic(path: &std::path::Path, text: &str) {
+fn write_atomic(path: &Path, text: &str) {
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, path);

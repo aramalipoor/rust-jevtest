@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" role="img" aria-label="Tests run per change before and after jevtest: 91 to 28 (69% fewer), 917 to 163 (82% fewer), 1,717 to 197 (89% fewer), 2,036 to about 54 (97% fewer). Up to 97% fewer tests, 2.5 to 6.2 times faster test runs, 4 of 4 planted bugs caught. Early measurements on two private production Rust codebases.">
+  <title>jevtest impact</title>
+  <desc>Tests run per change before and after jevtest: 91 to 28 (69% fewer), 917 to 163 (82% fewer), 1,717 to 197 (89% fewer), 2,036 to about 54 (97% fewer). Up to 97% fewer tests, 2.5 to 6.2 times faster test runs, 4 of 4 planted bugs caught. Early measurements on two private production Rust codebases.</desc>
+  <style>
+    .s{font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif}
+    .m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace}
+    .fg{fill:#F2F4F7} .mu{fill:#8B95A3} .di{fill:#566070}
+  </style>
+  <defs>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="884" y1="0" x2="1086" y2="0">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="accv" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="1279" height="479" rx="20" fill="#0B0F14" stroke="#1E2631"/>
+  <g class="s">
+    <text x="64" y="60" class="m di" font-size="13" letter-spacing="2">IMPACT</text>
+    <text x="64" y="92" class="fg" font-size="24" font-weight="600">Tests run per change</text>
+    <rect x="534" y="76" width="22" height="8" rx="4" fill="#2A3340"/>
+    <text x="564" y="85" class="mu" font-size="13">without jevtest</text>
+    <rect x="672" y="76" width="22" height="8" rx="4" fill="url(#acc)"/>
+    <text x="702" y="85" class="mu" font-size="13">with jevtest</text>
+  </g>
+  <g class="s">
+    <text x="64" y="140" class="fg" font-size="16" font-weight="600">One crate changed<tspan class="mu" font-size="13" font-weight="400" dx="10">91 tests in reach</tspan></text>
+    <text x="728" y="140" text-anchor="end" class="m" font-size="15"><tspan class="di">91 → </tspan><tspan class="fg" font-weight="600">28</tspan></text>
+    <text x="792" y="140" text-anchor="end" class="m" font-size="15" font-weight="700" fill="#2DD4BF">−69%</text>
+    <rect x="64" y="154" width="728" height="12" rx="6" fill="#1D242E"/>
+    <rect x="64" y="154" width="224.0" height="12" rx="6" fill="url(#acc)"/>
+    <text x="64" y="214" class="fg" font-size="16" font-weight="600">Shared storage crate<tspan class="mu" font-size="13" font-weight="400" dx="10">16 crates reached</tspan></text>
+    <text x="728" y="214" text-anchor="end" class="m" font-size="15"><tspan class="di">917 → </tspan><tspan class="fg" font-weight="600">163</tspan></text>
+    <text x="792" y="214" text-anchor="end" class="m" font-size="15" font-weight="700" fill="#2DD4BF">−82%</text>
+    <rect x="64" y="228" width="728" height="12" rx="6" fill="#1D242E"/>
+    <rect x="64" y="228" width="129.4" height="12" rx="6" fill="url(#acc)"/>
+    <text x="64" y="288" class="fg" font-size="16" font-weight="600">Four crates changed<tspan class="mu" font-size="13" font-weight="400" dx="10">25 crates reached</tspan></text>
+    <text x="728" y="288" text-anchor="end" class="m" font-size="15"><tspan class="di">1,717 → </tspan><tspan class="fg" font-weight="600">197</tspan></text>
+    <text x="792" y="288" text-anchor="end" class="m" font-size="15" font-weight="700" fill="#8B5CF6">−89%</text>
+    <rect x="64" y="302" width="728" height="12" rx="6" fill="#1D242E"/>
+    <rect x="64" y="302" width="83.5" height="12" rx="6" fill="url(#acc)"/>
+    <text x="64" y="362" class="fg" font-size="16" font-weight="600">Server, planted bug<tspan class="mu" font-size="13" font-weight="400" dx="10">whole suite</tspan></text>
+    <text x="728" y="362" text-anchor="end" class="m" font-size="15"><tspan class="di">2,036 → </tspan><tspan class="fg" font-weight="600">~54</tspan></text>
+    <text x="792" y="362" text-anchor="end" class="m" font-size="15" font-weight="700" fill="#8B5CF6">−97%</text>
+    <rect x="64" y="376" width="728" height="12" rx="6" fill="#1D242E"/>
+    <rect x="64" y="376" width="19.3" height="12" rx="6" fill="url(#acc)"/>
+  </g>
+  <rect x="856" y="60" width="360" height="100" rx="14" fill="#10161E" stroke="#1E2631"/>
+  <rect x="856" y="84" width="3" height="52" rx="1.5" fill="url(#accv)"/>
+  <text x="884" y="112" class="m" font-size="34" font-weight="700"><tspan class="s mu" font-size="18" font-weight="500">up to </tspan><tspan fill="url(#tile)">97%</tspan></text>
+  <text x="884" y="138" class="s mu" font-size="15">fewer tests</text>
+  <rect x="856" y="174" width="360" height="100" rx="14" fill="#10161E" stroke="#1E2631"/>
+  <rect x="856" y="198" width="3" height="52" rx="1.5" fill="url(#accv)"/>
+  <text x="884" y="226" class="m" font-size="34" font-weight="700"><tspan fill="url(#tile)">2.5–6.2×</tspan></text>
+  <text x="884" y="252" class="s mu" font-size="15">faster test runs</text>
+  <rect x="856" y="288" width="360" height="100" rx="14" fill="#10161E" stroke="#1E2631"/>
+  <rect x="856" y="312" width="3" height="52" rx="1.5" fill="url(#accv)"/>
+  <text x="884" y="340" class="m" font-size="34" font-weight="700"><tspan fill="url(#tile)">4/4</tspan></text>
+  <text x="884" y="366" class="s mu" font-size="15">planted bugs caught</text>
+  <line x1="64" x2="1216" y1="420" y2="420" stroke="#1E2631"/>
+  <text x="64" y="448" class="s di" font-size="13">Early measurements on two private production Rust codebases.</text>
+</svg>
