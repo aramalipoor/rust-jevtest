@@ -1,7 +1,18 @@
 [package]
-name = "cargo-jevtest"
+name = "jevtest"
 version = "0.1.0"
 edition = "2024"
+description = "Run only the Rust tests your change can break: crate reach, syn test discovery and TypeSafe Jev judgments, as a cargo nextest filter."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["test-selection", "nextest", "testing", "ai", "cargo-subcommand"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins"]
+exclude = ["/target"]
+default-run = "cargo-jevtest"
+
+[[bin]]
+name = "cargo-jevtest"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
