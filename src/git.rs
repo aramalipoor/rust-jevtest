@@ -226,31 +226,35 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
     Ok(files)
 }
 
-/// Keeps the changes under `patterns` (paths or globs). A listed path that exists on the target
-/// side but has no change in scope is added as wholly changed, so `--files src/x.rs` means "the
-/// impact of this file".
+/// Keeps the changes under `patterns` (paths, directories or globs). A pattern naming one existing
+/// file (not a directory, not a glob) that has no change in scope is added as wholly changed, so
+/// `--files src/x.rs` means "the impact of this file"; directories and globs only narrow.
 pub fn restrict(root: &Path, files: Vec<FileChange>, patterns: &[String], target: &Target) -> Result<Vec<FileChange>, String> {
     let mut b = globset::GlobSetBuilder::new();
+    let mut plain: Vec<&str> = Vec::new();
     for p in patterns {
         let p = p.trim_start_matches("./").trim_end_matches('/');
         b.add(globset::Glob::new(p).map_err(|e| format!("--files: bad glob {p}: {e}"))?);
         b.add(globset::Glob::new(&format!("{p}/**")).map_err(|e| format!("--files: bad glob {p}: {e}"))?);
+        if !p.contains(['*', '?', '[', '{']) {
+            plain.push(p);
+        }
     }
     let set = b.build().map_err(|e| e.to_string())?;
     let hit = |f: &FileChange| f.new_path.iter().chain(&f.old_path).any(|p| set.is_match(p));
     let mut kept: Vec<FileChange> = files.into_iter().filter(hit).collect();
 
     let mut source = Source::new(root, target)?;
-    let all = source.list(root, "")?;
-    for path in all.iter().filter(|p| set.is_match(p.as_str())) {
-        if kept.iter().any(|f| f.new_path.as_deref() == Some(path.as_str())) {
+    for path in plain {
+        if kept.iter().any(|f| f.new_path.as_deref() == Some(path)) {
             continue;
         }
+        // `read` yields nothing for a directory (a tree at a revision) or a missing path.
         let Some(text) = source.read(path) else { continue };
         let lines = text.lines().count().max(1) as u32;
         kept.push(FileChange {
-            old_path: Some(path.clone()),
-            new_path: Some(path.clone()),
+            old_path: Some(path.to_owned()),
+            new_path: Some(path.to_owned()),
             status: Status::Modified,
             new_ranges: vec![(1, lines)],
             old_ranges: vec![(1, lines)],

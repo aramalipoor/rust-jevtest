@@ -45,7 +45,7 @@ pub struct TestRef {
     pub name: String,
 }
 
-/// Ordered strongest first: `Direct` > `Helper` > `Transitive(1)` > `Transitive(2)` ...
+/// Ordered strongest first: `Direct` > `Helper` > `Transitive(1)` > `Transitive(2)` ... > `Dependency`.
 /// `Covered(n)` comes from the coverage map, not from this module: the test executed `n` changed
 /// functions when the map was built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,10 @@ pub enum EvidenceKind {
     Helper,
     Transitive(u8),
     Covered(u32),
+    /// A dependency of the test's package changed (`Cargo.lock`, the manifest's dependency
+    /// tables, a path dependency's files). Recorded by select.rs, not by [`evidence`]: it names
+    /// no item, so it neither boosts nor skips screening.
+    Dependency,
 }
 
 #[derive(Clone, Debug)]

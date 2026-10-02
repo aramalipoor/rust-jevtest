@@ -4,7 +4,8 @@ use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 
-use crate::config::{Config, CoveragePolicy, OnJevError, Runner, WithoutJev};
+use crate::config::{Config, CoveragePolicy, OnJevError, Outside, Runner, WithoutJev};
+use crate::evidence::EvidenceKind;
 use crate::jev::Usage;
 use crate::select::{BOOST, Candidate, JevState, Judge, Must, Screen, Selection, VIEWS, evidence_kind, is_static};
 
@@ -318,6 +319,21 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
     if !s.ignored.is_empty() {
         let _ = writeln!(o, "path policy: {} ignored", s.ignored.len());
     }
+    if !s.outside_ignored.is_empty() {
+        let why = match cfg.paths.outside {
+            Outside::Ignore => "paths.outside = \"ignore\"",
+            _ => "no Rust source names them",
+        };
+        let shown = if verbose { s.outside_ignored.len() } else { s.outside_ignored.len().min(8) };
+        let more = s.outside_ignored.len() - shown;
+        let _ = writeln!(
+            o,
+            "path policy: {} outside every package, ignored ({why}): {}{}",
+            s.outside_ignored.len(),
+            s.outside_ignored[..shown].join(", "),
+            if more > 0 { format!(" and {more} more") } else { String::new() }
+        );
+    }
     for e in &s.escalations {
         let pkg = e.package.map(|p| format!(" [{}]", name(p))).unwrap_or_default();
         let _ = writeln!(o, "path policy: {}{pkg}: {} ({})", e.kind, e.file, e.reason);
@@ -339,20 +355,22 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
         let _ = writeln!(o, "FULL RUN: {why}");
     } else {
         let must = |m: Must| count(s, |c| c.must == Some(m));
+        let kind = |k: fn(&EvidenceKind) -> bool| count(s, |c| c.evidence.as_ref().is_some_and(|(e, _)| k(e)));
         let _ = writeln!(o, "discovery: {} tests", s.candidates.len());
         let _ = writeln!(
             o,
-            "static: must {} (changed {}, package {}, direct {}, helper {}); evidence on {} (direct {}, helper {}, transitive {}), boosted {}",
+            "static: must {} (changed {}, package {}, direct {}, helper {}); evidence on {} (direct {}, helper {}, transitive {}), boosted {}; dependency changed for {}",
             count(s, |c| c.must.is_some_and(|m| m != Must::Covered)),
             must(Must::Changed),
             must(Must::Package),
             must(Must::Direct),
             must(Must::Helper),
             count(s, |c| c.evidence.as_ref().is_some_and(|(k, _)| is_static(*k))),
-            count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Direct, _)))),
-            count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Helper, _)))),
-            count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Transitive(_), _)))),
+            kind(|e| *e == EvidenceKind::Direct),
+            kind(|e| *e == EvidenceKind::Helper),
+            kind(|e| matches!(e, EvidenceKind::Transitive(_))),
             count(s, |c| c.bonus > 0.0 && c.evidence.as_ref().is_some_and(|(k, _)| is_static(*k))),
+            kind(|e| *e == EvidenceKind::Dependency),
         );
         let _ = writeln!(o, "{}", coverage_line(s));
         match &s.jev {
@@ -371,30 +389,35 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
                     cfg.select.group_threshold,
                     count(s, |c| c.screen == Screen::Dropped)
                 );
+                let top = |c: &Candidate| has_reason(c, "top-n:names") || has_reason(c, "top-n:body");
+                let thr = |c: &Candidate| has_reason(c, "threshold");
                 let _ = writeln!(
                     o,
-                    "judging: {} tests judged in views [{}]; picked top-{} (at most {:.0}% per view) names {}, body {}, threshold(>= {}) {}, union {}; unjudged {}",
+                    "judging: {} tests judged in views [{}]; picked {}: top-{} (at most {:.0}% per view) {} (names {}, body {}), threshold (>= {}) {}; only by top-n {}, only by threshold {}; unjudged {}",
                     count(s, |c| c.judge == Judge::Judged),
                     cfg.jev.views.join(", "),
+                    count(s, |c| top(c) || thr(c)),
                     cfg.select.top_n,
                     cfg.select.top_fraction * 100.0,
+                    count(s, top),
                     count(s, |c| has_reason(c, "top-n:names")),
                     count(s, |c| has_reason(c, "top-n:body")),
                     cfg.select.threshold,
-                    count(s, |c| has_reason(c, "threshold")),
-                    count(s, |c| c.judge == Judge::Judged && c.selected),
+                    count(s, thr),
+                    count(s, |c| top(c) && !thr(c)),
+                    count(s, |c| thr(c) && !top(c)),
                     count(s, |c| has_reason(c, "unjudged") || has_reason(c, "uncached")),
                 );
                 let src = key_source.unwrap_or("none");
                 for (stage, u) in &s.stages {
                     let _ = writeln!(
                         o,
-                        "jev {stage}: {} questions, {} requests ({} split), {} cache hits{}, {} in + {} out tokens, ${:.4}, {} ms",
+                        "jev {stage}: {} questions, {} cached{}, {} requests ({} split), {} in + {} out tokens, ${:.4}, {} ms",
                         u.asked,
-                        u.requests,
-                        u.splits,
                         u.cache_hits,
                         if u.uncached > 0 { format!(", {} uncached", u.uncached) } else { String::new() },
+                        u.requests,
+                        u.splits,
                         u.input_tokens,
                         u.output_tokens,
                         u.est_cost_usd(),
@@ -407,23 +430,29 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
                 }
             }
         }
+        let rules = s.rule_runs.len();
+        let always = cfg.tests.always.len();
+        let mut extra = String::new();
+        if rules > 0 {
+            let _ = write!(extra, " + {rules} rule filterset{}", if rules == 1 { "" } else { "s" });
+        }
+        if always > 0 {
+            let _ = write!(extra, " + {always} tests.always filterset{}", if always == 1 { "" } else { "s" });
+        }
+        if !extra.is_empty() {
+            extra.push_str(" (nextest resolves them)");
+        }
         let _ = writeln!(
             o,
-            "policy: selected {} of {} (max-tests dropped {}, min-tests added {})",
+            "policy: selected {} of {} tests{extra} (max-tests dropped {}, min-tests added {})",
             count(s, |c| c.selected),
             s.candidates.len(),
             count(s, |c| has_reason(c, "max-tests")),
             count(s, |c| has_reason(c, "min-tests")),
         );
     }
-    if !s.rule_runs.is_empty() || !cfg.tests.always.is_empty() || !cfg.tests.never.is_empty() {
-        let _ = writeln!(
-            o,
-            "filtersets: rules {}, always {}, never {}",
-            s.rule_runs.len(),
-            cfg.tests.always.len(),
-            cfg.tests.never.len()
-        );
+    if !cfg.tests.never.is_empty() {
+        let _ = writeln!(o, "filtersets: never {}", cfg.tests.never.len());
     }
     for n in &plan.notes {
         let _ = writeln!(o, "note: {n}");
@@ -432,6 +461,10 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
         for c in s.candidates.iter().filter(|c| c.selected) {
             let _ = writeln!(o, "  + {} {} [{}]", name(c.pkg), test_path(c), c.reasons.join(", "));
         }
+    }
+    if verbose {
+        let laps: Vec<String> = s.timings.iter().map(|(layer, ms)| format!("{layer} {ms:.0}")).collect();
+        let _ = writeln!(o, "timings (ms): {}", laps.join(", "));
     }
     let _ = write!(o, "done in {} ms", s.wall_ms);
     o
@@ -525,6 +558,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
             "old_ranges": f.old_ranges,
         })).collect::<Vec<_>>(),
         "ignored_files": s.ignored,
+        "outside_ignored_files": s.outside_ignored,
         "escalations": s.escalations.iter().map(|e| json!({
             "file": e.file,
             "kind": e.kind,
@@ -539,9 +573,17 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
         "changed_packages": s.changed.iter().map(|&p| name(p)).collect::<Vec<_>>(),
         "reached_packages": s.reached.iter().map(|&(p, d)| json!({"name": name(p), "depth": d})).collect::<Vec<_>>(),
         "whole_packages": s.whole.iter().map(|(&p, why)| json!({"name": name(p), "reason": why})).collect::<Vec<_>>(),
+        "dependency_packages": s.dependency.iter().map(|(&p, why)| json!({"name": name(p), "changes": why})).collect::<Vec<_>>(),
         "changed_items": s.symbols,
         "candidates": candidates,
         "selected": s.candidates.iter().filter(|c| c.selected).count(),
+        "picks": {
+            "top_n": count(s, |c| has_reason(c, "top-n:names") || has_reason(c, "top-n:body")),
+            "threshold": count(s, |c| has_reason(c, "threshold")),
+            "only_top_n": count(s, |c| (has_reason(c, "top-n:names") || has_reason(c, "top-n:body")) && !has_reason(c, "threshold")),
+            "only_threshold": count(s, |c| has_reason(c, "threshold") && !has_reason(c, "top-n:names") && !has_reason(c, "top-n:body")),
+        },
+        "filtersets_run": if s.full.is_some() { 0 } else { s.rule_runs.len() + cfg.tests.always.len() },
         "jev": {
             "enabled": jev_enabled,
             "off_reason": jev_off,
@@ -564,6 +606,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
         "command": plan.commands.iter().map(|c| command_line(c)).collect::<Vec<_>>().join("\n"),
         "notes": plan.notes,
         "wall_ms": s.wall_ms as u64,
+        "timings_ms": s.timings.iter().map(|(layer, ms)| json!({"layer": layer, "ms": (ms * 10.0).round() / 10.0})).collect::<Vec<_>>(),
     })
 }
 
@@ -637,6 +680,7 @@ pub fn explain(s: &Selection, cfg: &Config, pattern: &str) -> String {
                 syms.join(", "),
                 if c.must.is_some() { " → must".to_owned() } else { format!(" → boost +{BOOST}, skips screening") }
             ),
+            (None, Some((EvidenceKind::Dependency, whys))) => format!("dependency changed: {} → Jev judges it (no boost)", whys.join("; ")),
             (Some(Must::Package), _) => "whole package → must".to_owned(),
             _ => "none".to_owned(),
         };

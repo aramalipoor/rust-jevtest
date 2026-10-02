@@ -58,7 +58,7 @@ impl Default for Select {
         Self {
             top_n: 30,
             top_fraction: 0.25,
-            threshold: 0.5,
+            threshold: 0.85,
             group_threshold: 0.1,
             max_tests: 0,
             min_tests: 0,
@@ -188,25 +188,34 @@ impl Runner {
     }
 }
 
+/// What a changed file outside every workspace package (and every path dependency) does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outside {
+    /// Packages whose Rust source names the file (a string literal holding its path, its
+    /// basename or a parent directory) run whole; files nothing names are ignored.
+    Referenced,
+    /// Any such file runs the full suite.
+    Full,
+    /// Such files never affect selection.
+    Ignore,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Paths {
     pub ignore: Vec<String>,
     pub full_run: Vec<String>,
+    pub outside: Outside,
 }
 
 impl Default for Paths {
     fn default() -> Self {
         Self {
             ignore: strings(&["**/*.md", "docs/**", ".github/**"]),
-            full_run: strings(&[
-                "Cargo.toml",
-                "Cargo.lock",
-                "rust-toolchain",
-                "rust-toolchain.toml",
-                ".cargo/**",
-                ".config/nextest.toml",
-            ]),
+            // The root Cargo.toml and Cargo.lock are diffed semantically instead (select.rs).
+            full_run: strings(&["rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]),
+            outside: Outside::Referenced,
         }
     }
 }
@@ -573,12 +582,12 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # max_files = 60              # auto size guard: changed files (ignored paths not counted)
 # max_lines = 3000            # auto size guard: changed lines, both sides
 # include_untracked = true    # untracked .rs files count as added (modes that include the working tree)
-# files = []                  # only these paths/globs; a listed file with no diff counts as wholly changed
+# files = []                  # only these paths/globs/directories; a listed file (not a directory or glob) with no diff counts as wholly changed
 
 [select]
 # top_n = 30                  # tests taken from the top of each Jev view
 # top_fraction = 0.25         # ...but at most this share (0..1) of the tests that view ranked
-# threshold = 0.5             # a test scoring at or above this (0..1) is always selected
+# threshold = 0.85            # a test scoring at or above this (0..1) is always selected
 # group_threshold = 0.1       # stage-1 screening cutoff per module group; groups with static evidence are kept
 # max_tests = 0               # cap on selected tests (0 = no cap); drops the lowest-scored non-must picks
 # min_tests = 0               # pad the selection with the next-best scores up to this many tests
@@ -592,7 +601,12 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 
 [paths]
 # ignore = ["**/*.md", "docs/**", ".github/**"]   # changed files matching these globs never affect selection
-# full_run = ["Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]   # any change here runs the full suite
+# full_run = ["rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]   # any change here runs the full suite
+#                             # The root Cargo.toml and Cargo.lock are read, not matched: version stamps are ignored,
+#                             # dependency changes make the packages that use them changed, anything else runs the full suite.
+# outside = "referenced"      # referenced | full | ignore: a changed file outside every package runs the packages whose
+#                             # Rust source names it (path, basename or parent directory in a string literal) whole;
+#                             # files nothing names are ignored
 
 [tests]
 # always = []                 # nextest filtersets always run (smoke tests)
@@ -611,7 +625,7 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # max_test_chars = 800                                  # test source per body question, in chars
 # max_group_chars = 600                                 # group description per screening question, in chars
 # timeout_secs = 30                                     # per-request timeout, in seconds
-# cache_dir = "~/.cache/jevtest"                        # verdict cache; `cargo jevtest cache clear` empties it
+# cache_dir = "~/.cache/jevtest"                        # answer cache, one file per question; `cargo jevtest cache clear` empties it
 
 [coverage]
 # Per-test coverage map from `cargo jevtest coverage build` (build it nightly on the default branch).

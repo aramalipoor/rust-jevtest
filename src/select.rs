@@ -8,13 +8,15 @@ use std::time::Instant;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::{Value, json};
 
-use crate::config::{Config, CoveragePolicy, NonRust, OnJevError, StaticEvidence, WithoutJev};
+use crate::config::{Config, CoveragePolicy, NonRust, OnJevError, Outside, StaticEvidence, WithoutJev};
 use crate::coverage::{self, COVER_BOOST, LooseFile};
 use crate::evidence::{self, ChangedItem, EvidenceKind, SourceFile, TestRef};
 use crate::git::{self, FileChange, Range, Source, Status, Target};
 use crate::jev::{self, Answer, Usage};
+use crate::manifest::{self, Verdict};
+use crate::outside;
 use crate::scan::{self, TestFn};
-use crate::workspace::Workspace;
+use crate::workspace::{PathDep, Workspace};
 
 /// Ranking bonus for tests with static evidence that is not a must.
 pub const BOOST: f64 = 0.2;
@@ -58,12 +60,14 @@ pub fn evidence_kind(kind: EvidenceKind) -> String {
         EvidenceKind::Helper => "helper".into(),
         EvidenceKind::Transitive(d) => format!("transitive({d})"),
         EvidenceKind::Covered(n) => format!("covered({n})"),
+        EvidenceKind::Dependency => "dependency".into(),
     }
 }
 
-/// Static evidence (from source), as opposed to the coverage map's `Covered`.
+/// Static evidence (from source names), as opposed to the coverage map's `Covered` or a changed
+/// `Dependency`; only static evidence earns [`BOOST`].
 pub fn is_static(kind: EvidenceKind) -> bool {
-    !matches!(kind, EvidenceKind::Covered(_))
+    matches!(kind, EvidenceKind::Direct | EvidenceKind::Helper | EvidenceKind::Transitive(_))
 }
 
 /// Stage-1 (screening) verdict.
@@ -147,7 +151,8 @@ pub struct Group {
 
 pub struct Escalation {
     pub file: String,
-    /// `full` (whole workspace) or `whole` (one package).
+    /// `full` (whole workspace), `whole` (one package), `changed` (the package counts as
+    /// changed: a dependency moved) or `ignored` (examined, changes nothing: a version stamp).
     pub kind: &'static str,
     pub package: Option<usize>,
     pub reason: String,
@@ -174,6 +179,9 @@ pub struct Selection {
     pub files: Vec<FileChange>,
     pub ws: Workspace,
     pub ignored: Vec<String>,
+    /// Files outside every package that no Rust source names (or all of them under
+    /// `paths.outside = "ignore"`).
+    pub outside_ignored: Vec<String>,
     pub escalations: Vec<Escalation>,
     pub rules_fired: Vec<RuleFired>,
     /// Changed packages, by name.
@@ -185,6 +193,9 @@ pub struct Selection {
     pub items: Vec<ChangedItem>,
     /// Packages whose every test must run → why.
     pub whole: BTreeMap<usize, String>,
+    /// Packages changed through a dependency (lockfile, manifest dependency tables, a path
+    /// dependency) → what changed.
+    pub dependency: BTreeMap<usize, Vec<String>>,
     pub candidates: Vec<Candidate>,
     pub groups: Vec<Group>,
     pub stages: Vec<(&'static str, Usage)>,
@@ -198,6 +209,22 @@ pub struct Selection {
     /// The coverage layer's map, policy and verdicts.
     pub coverage: coverage::State,
     pub wall_ms: u128,
+    /// Wall time per layer in run order, in ms.
+    pub timings: Vec<(&'static str, f64)>,
+}
+
+/// Splits a run's wall time into named layers.
+struct Laps {
+    last: Instant,
+    laps: Vec<(&'static str, f64)>,
+}
+
+impl Laps {
+    fn mark(&mut self, layer: &'static str) {
+        let now = Instant::now();
+        self.laps.push((layer, (now - self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
 }
 
 pub fn globset(patterns: &[String]) -> Result<GlobSet, String> {
@@ -214,6 +241,7 @@ fn overlaps(ranges: &[Range], start: u32, end: u32) -> bool {
 
 pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switches) -> Result<Selection, String> {
     let started = Instant::now();
+    let mut laps = Laps { last: started, laps: Vec::new() };
     let sel = &cfg.select;
     let base = scope.base.clone();
     let target = scope.target.clone();
@@ -223,7 +251,9 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     if !cfg.changes.files.is_empty() {
         files = git::restrict(root, files, &cfg.changes.files, &target)?;
     }
+    laps.mark("intake");
     let ws = Workspace::load(root)?;
+    laps.mark("cargo metadata");
     let full_run = globset(&cfg.paths.full_run)?;
     let ignore = globset(&cfg.paths.ignore)?;
     let rule_sets: Vec<GlobSet> = cfg.rules.iter().map(|r| globset(&r.when)).collect::<Result<_, _>>()?;
@@ -240,6 +270,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         files: Vec::new(),
         ws,
         ignored: Vec::new(),
+        outside_ignored: Vec::new(),
         escalations: Vec::new(),
         rules_fired: Vec::new(),
         changed: Vec::new(),
@@ -247,6 +278,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         symbols: Vec::new(),
         items: Vec::new(),
         whole: BTreeMap::new(),
+        dependency: BTreeMap::new(),
         candidates: Vec::new(),
         groups: Vec::new(),
         stages: Vec::new(),
@@ -256,6 +288,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         rule_runs: Vec::new(),
         coverage: cov_state,
         wall_ms: 0,
+        timings: Vec::new(),
     };
     let ws = &out.ws;
 
@@ -264,6 +297,10 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     let mut fired: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut full_reasons: Vec<String> = Vec::new();
     let mut seen_items: HashSet<(String, String)> = HashSet::new();
+    // Non-ignored files outside every package and path dependency; `paths.outside` decides.
+    let mut outside: Vec<String> = Vec::new();
+    let mut path_deps: Option<Vec<PathDep>> = None;
+    let root_pkg = ws.packages.iter().position(|p| p.dir.is_empty());
     for f in &files {
         let mut paths: Vec<&str> = f.new_path.iter().chain(&f.old_path).map(String::as_str).collect();
         paths.dedup();
@@ -291,17 +328,79 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
                 out.ignored.push(path.to_owned());
                 continue;
             }
-            let Some(pkg) = ws.owner(path) else {
-                full_reasons.push(format!("{path} is outside every package"));
-                out.escalations.push(Escalation { file: path.into(), kind: "full", package: None, reason: "outside every package".into() });
+            let owner = ws.owner(path);
+            let rel = |pkg: usize| {
+                let pdir = &ws.packages[pkg].dir;
+                if pdir.is_empty() { path } else { &path[pdir.len() + 1..] }
+            };
+            if path == "Cargo.toml" || path == "Cargo.lock" || owner.is_some_and(|p| rel(p) == "Cargo.toml") {
+                let old = if f.old_path.as_deref() == Some(path) && !matches!(f.status, Status::Added | Status::Untracked) {
+                    if old_src.is_none() {
+                        old_src = Some(Source::at(root, &out.base)?);
+                    }
+                    old_src.as_mut().and_then(|s| s.read(path))
+                } else {
+                    None
+                };
+                let new = if f.new_path.as_deref() == Some(path) { new_src.read(path) } else { None };
+                let verdict = match (path, owner) {
+                    ("Cargo.toml", _) => manifest::root(old.as_deref(), new.as_deref(), ws, root_pkg),
+                    ("Cargo.lock", _) => manifest::lockfile(old.as_deref(), new.as_deref(), ws),
+                    (_, Some(pkg)) => manifest::member(old.as_deref(), new.as_deref(), ws, pkg),
+                    (_, None) => unreachable!("a member manifest has an owner"),
+                };
+                let esc = |kind, package, reason| Escalation { file: path.into(), kind, package, reason };
+                match verdict {
+                    Verdict::Ignore(why) => out.escalations.push(esc("ignored", owner, why)),
+                    Verdict::Changed(list) => {
+                        for (pkg, why) in list {
+                            changed.insert(pkg);
+                            out.dependency.entry(pkg).or_default().push(why.clone());
+                            out.escalations.push(esc("changed", Some(pkg), why));
+                        }
+                    }
+                    Verdict::Whole(why) => {
+                        let pkg = owner.expect("only member manifests run whole");
+                        changed.insert(pkg);
+                        whole_package(&mut out.whole, &mut out.escalations, pkg, path, why);
+                    }
+                    Verdict::Full(why) => {
+                        full_reasons.push(format!("{path}: {why}"));
+                        out.escalations.push(esc("full", None, why));
+                    }
+                }
+                continue;
+            }
+            let Some(pkg) = owner else {
+                let deps = path_deps.get_or_insert_with(|| {
+                    ws.path_deps(root).unwrap_or_else(|e| {
+                        eprintln!("jevtest: {e}; path dependencies count as outside every package");
+                        Vec::new()
+                    })
+                });
+                let dep = deps
+                    .iter()
+                    .filter(|d| !d.dependents.is_empty() && path.strip_prefix(d.dir.as_str()).is_some_and(|r| r.starts_with('/')))
+                    .max_by_key(|d| d.dir.len());
+                match dep {
+                    Some(d) => {
+                        let why = format!("path dependency {} ({}) changed", d.name, d.dir);
+                        for &m in &d.dependents {
+                            changed.insert(m);
+                            let list = out.dependency.entry(m).or_default();
+                            if !list.contains(&why) {
+                                list.push(why.clone());
+                                out.escalations.push(Escalation { file: path.into(), kind: "changed", package: Some(m), reason: why.clone() });
+                            }
+                        }
+                    }
+                    None => outside.push(path.to_owned()),
+                }
                 continue;
             };
             changed.insert(pkg);
-            let pdir = &ws.packages[pkg].dir;
-            let rel = if pdir.is_empty() { path } else { &path[pdir.len() + 1..] };
-            let whole_why = if rel == "Cargo.toml" {
-                Some("manifest changed")
-            } else if rel == "build.rs" {
+            let rel = rel(pkg);
+            let whole_why = if rel == "build.rs" {
                 Some("build script changed")
             } else if !path.ends_with(".rs") {
                 (sel.non_rust == NonRust::WholePackage).then_some("non-Rust file changed")
@@ -369,7 +468,44 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         }
     }
     drop(old_src);
+    laps.mark("path policy");
 
+    match cfg.paths.outside {
+        Outside::Full => {
+            for path in outside {
+                full_reasons.push(format!("{path} is outside every package"));
+                out.escalations.push(Escalation { file: path, kind: "full", package: None, reason: "outside every package (paths.outside = \"full\")".into() });
+            }
+        }
+        Outside::Ignore => out.outside_ignored = outside,
+        Outside::Referenced if !outside.is_empty() => {
+            let finder = outside::Finder::new(&outside);
+            let mut read = vec![false; outside.len()];
+            for pkg in 0..ws.packages.len() {
+                let pdir = ws.packages[pkg].dir.as_str();
+                let mut found: BTreeMap<usize, outside::Reference> = BTreeMap::new();
+                for path in rust_files(&new_src.list(root, pdir)?, pdir) {
+                    let Some(src) = new_src.read(&path) else { continue };
+                    for r in finder.scan(&path, &src) {
+                        found.entry(r.file).or_insert(r);
+                    }
+                    if found.len() == outside.len() {
+                        break;
+                    }
+                }
+                for (i, r) in found {
+                    read[i] = true;
+                    changed.insert(pkg);
+                    let why = format!("reads {} (\"{}\" at {})", outside[i], r.literal, r.at);
+                    whole_package(&mut out.whole, &mut out.escalations, pkg, &outside[i], why);
+                }
+            }
+            out.outside_ignored = outside.into_iter().zip(read).filter(|(_, r)| !r).map(|(p, _)| p).collect();
+        }
+        Outside::Referenced => {}
+    }
+
+    laps.mark("outside references");
     for (index, files) in fired {
         let rule = &cfg.rules[index];
         out.rule_runs.extend(rule.run.iter().cloned());
@@ -383,6 +519,11 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         out.rules_fired.push(RuleFired { index, files });
     }
     out.rule_runs.dedup();
+    for (&pkg, whys) in &out.dependency {
+        for why in whys {
+            out.symbols.push(format!("{}: dependency: {why}", ws.packages[pkg].name));
+        }
+    }
     if !full_reasons.is_empty() {
         out.full = Some(full_reasons.join("; "));
     }
@@ -400,9 +541,13 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     out.reached = reached;
     out.files = files;
     if out.full.is_some() {
+        laps.mark("reach");
+        out.timings = laps.laps;
         out.wall_ms = started.elapsed().as_millis();
         return Ok(out);
     }
+
+    laps.mark("reach");
 
     // Layer 4: discovery.
     let ws = &out.ws;
@@ -456,6 +601,8 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         }
     }
 
+    laps.mark("discovery");
+
     // Layer 5: static evidence.
     if sel.static_evidence != StaticEvidence::Off && !out.items.is_empty() {
         let files: Vec<SourceFile> = sources
@@ -483,6 +630,16 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         }
     }
     drop(sources);
+    // A changed dependency is evidence for every test of the package that has none stronger.
+    for c in &mut candidates {
+        if c.evidence.is_none()
+            && let Some(whys) = out.dependency.get(&c.pkg)
+        {
+            c.evidence = Some((EvidenceKind::Dependency, whys.clone()));
+        }
+    }
+
+    laps.mark("static evidence");
 
     // Layer 5b: coverage map (gate / must / boost).
     if let Some(map) = &cov_map {
@@ -547,6 +704,8 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
             None => JevState::Off("no API key".into()),
         }
     };
+
+    laps.mark("jev");
 
     // Layer 8: policy.
     let failure = out.stages.iter().find_map(|(_, u)| u.failures.first().cloned());
@@ -641,6 +800,8 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
 
     out.candidates = candidates;
     out.groups = groups;
+    laps.mark("policy");
+    out.timings = laps.laps;
     out.wall_ms = started.elapsed().as_millis();
     Ok(out)
 }
@@ -809,6 +970,17 @@ fn judge_all(
 
 /// Repo-relative `.rs` files under package dir `pdir` that may hold its tests.
 fn test_files(all: &[String], pdir: &str) -> Vec<String> {
+    package_rs(all, pdir, false)
+}
+
+/// Every repo-relative `.rs` file of the package at `pdir` (build.rs, benches and examples too).
+fn rust_files(all: &[String], pdir: &str) -> Vec<String> {
+    package_rs(all, pdir, true)
+}
+
+/// `.rs` files under `pdir`, minus `target/` and nested packages; benches and examples only with
+/// `all_targets`.
+fn package_rs(all: &[String], pdir: &str, all_targets: bool) -> Vec<String> {
     let rel = |p: &str| -> Option<String> {
         if pdir.is_empty() { Some(p.to_owned()) } else { p.strip_prefix(pdir)?.strip_prefix('/').map(str::to_owned) }
     };
@@ -822,7 +994,7 @@ fn test_files(all: &[String], pdir: &str) -> Vec<String> {
         .filter(|p| p.ends_with(".rs"))
         .filter(|p| {
             let Some(r) = rel(p) else { return false };
-            if r.starts_with("benches/") || r.starts_with("examples/") || r.split('/').any(|c| c == "target") {
+            if (!all_targets && (r.starts_with("benches/") || r.starts_with("examples/"))) || r.split('/').any(|c| c == "target") {
                 return false;
             }
             !r.match_indices('/').any(|(i, _)| nested.contains(&r[..i]))

@@ -7,6 +7,8 @@ mod coverage;
 mod evidence;
 mod git;
 mod jev;
+mod manifest;
+mod outside;
 mod output;
 mod scan;
 mod select;
@@ -199,7 +201,7 @@ const AGENTS_BLOCK: &str = "<!-- jevtest -->
 - Red: fix the code (or the spec, and say which) and rerun `cargo jevtest run` until it is green. Never loosen or skip a failing test.
 - Why was a test picked or skipped? `cargo jevtest explain <PATTERN>`.
 - Machine-readable selection: `cargo jevtest --format json`.
-- Changes to `Cargo.toml`, `Cargo.lock`, the toolchain or `.config/nextest.toml` escalate to the full suite on their own; let it run.
+- Toolchain and `.config/nextest.toml` changes, and `Cargo.toml`/`Cargo.lock` changes beyond version stamps and dependency bumps, escalate to the full suite on their own; let it run.
 - The full suite still runs for releases and in CI.
 <!-- /jevtest -->";
 
@@ -340,10 +342,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
     let req = change_request(g)?;
     let ignore = select::globset(&cfg.paths.ignore)?;
+    let resolving = Instant::now();
     let scope = changes::resolve(&root, &cfg.changes, &req, &ignore)?;
+    let scope_ms = resolving.elapsed().as_secs_f64() * 1000.0;
     eprintln!("{}", scope.line());
     let sw = select::Switches { no_jev: g.no_jev, offline: g.offline };
-    let s = select::run(&root, &cfg, scope, &sw)?;
+    let mut s = select::run(&root, &cfg, scope, &sw)?;
+    s.timings.insert(0, ("changes", scope_ms));
     let extra: &[String] = match &cli.cmd {
         Some(Cmd::Run { args }) => args,
         _ => &[],
