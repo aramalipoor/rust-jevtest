@@ -239,17 +239,18 @@ fn overlaps(ranges: &[Range], start: u32, end: u32) -> bool {
     ranges.iter().any(|&(a, b)| a <= end && start <= b)
 }
 
-pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switches) -> Result<Selection, String> {
+pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Switches) -> Result<Selection, String> {
     let started = Instant::now();
     let mut laps = Laps { last: started, laps: Vec::new() };
     let sel = &cfg.select;
     let base = scope.base.clone();
     let target = scope.target.clone();
 
-    // Layer 1: intake, narrowed to `changes.files` when given.
-    let mut files = git::changed_files(root, &base, &target, cfg.changes.include_untracked)?;
+    // Layer 1: intake (the diff the scope already ran), narrowed to `changes.files` when given.
+    let mut new_src = Source::new(root, &target)?;
+    let mut files = std::mem::take(&mut scope.changes);
     if !cfg.changes.files.is_empty() {
-        files = git::restrict(root, files, &cfg.changes.files, &target)?;
+        files = git::restrict(files, &cfg.changes.files, &mut new_src)?;
     }
     laps.mark("intake");
     let ws = Workspace::load(root)?;
@@ -257,7 +258,6 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     let full_run = globset(&cfg.paths.full_run)?;
     let ignore = globset(&cfg.paths.ignore)?;
     let rule_sets: Vec<GlobSet> = cfg.rules.iter().map(|r| globset(&r.when)).collect::<Result<_, _>>()?;
-    let mut new_src = Source::new(root, &target)?;
     let mut old_src: Option<Source> = None;
     let (cov_map, cov_state) = coverage::open(root, &cfg.coverage, &base);
     // Changed lines outside items, per file side; only the coverage layer reads them.
@@ -299,7 +299,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     let mut seen_items: HashSet<(String, String)> = HashSet::new();
     // Non-ignored files outside every package and path dependency; `paths.outside` decides.
     let mut outside: Vec<String> = Vec::new();
-    let mut path_deps: Option<Vec<PathDep>> = None;
+    let mut path_deps = PathDeps::default();
     let root_pkg = ws.packages.iter().position(|p| p.dir.is_empty());
     for f in &files {
         let mut paths: Vec<&str> = f.new_path.iter().chain(&f.old_path).map(String::as_str).collect();
@@ -372,20 +372,10 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
                 continue;
             }
             let Some(pkg) = owner else {
-                let deps = path_deps.get_or_insert_with(|| {
-                    ws.path_deps(root).unwrap_or_else(|e| {
-                        eprintln!("jevtest: {e}; path dependencies count as outside every package");
-                        Vec::new()
-                    })
-                });
-                let dep = deps
-                    .iter()
-                    .filter(|d| !d.dependents.is_empty() && path.strip_prefix(d.dir.as_str()).is_some_and(|r| r.starts_with('/')))
-                    .max_by_key(|d| d.dir.len());
-                match dep {
-                    Some(d) => {
-                        let why = format!("path dependency {} ({}) changed", d.name, d.dir);
-                        for &m in &d.dependents {
+                match path_deps.find(root, ws, &mut new_src, path) {
+                    Some((name, dir, members)) => {
+                        let why = format!("path dependency {name} ({dir}) changed");
+                        for m in members {
                             changed.insert(m);
                             let list = out.dependency.entry(m).or_default();
                             if !list.contains(&why) {
@@ -484,9 +474,10 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
             for pkg in 0..ws.packages.len() {
                 let pdir = ws.packages[pkg].dir.as_str();
                 let mut found: BTreeMap<usize, outside::Reference> = BTreeMap::new();
-                for path in rust_files(&new_src.list(root, pdir)?, pdir) {
-                    let Some(src) = new_src.read(&path) else { continue };
-                    for r in finder.scan(&path, &src) {
+                let paths = rust_files(&new_src.list(root, pdir)?, pdir);
+                for (path, src) in paths.iter().zip(new_src.read_many(&paths)) {
+                    let Some(src) = src else { continue };
+                    for r in finder.scan(path, &src) {
                         found.entry(r.file).or_insert(r);
                     }
                     if found.len() == outside.len() {
@@ -553,46 +544,71 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     let ws = &out.ws;
     let new_ranges: HashMap<&str, &[Range]> =
         out.files.iter().filter_map(|f| Some((f.new_path.as_deref()?, f.new_ranges.as_slice()))).collect();
-    let mut sources: Vec<(String, String)> = Vec::new();
-    // (file, module) → that module's context for stage-1 group questions.
-    let mut contexts: HashMap<(String, String), String> = HashMap::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // Every candidate file of every reached package, read in one batch, parsed on all cores.
+    let mut owners: Vec<(usize, u32)> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     for &(pkg, depth) in &out.reached {
         let pdir = ws.packages[pkg].dir.as_str();
         for path in test_files(&new_src.list(root, pdir)?, pdir) {
-            let rel = if pdir.is_empty() { path.as_str() } else { &path[pdir.len() + 1..] };
-            let Some(src) = new_src.read(&path) else { continue };
-            match syn::parse_file(&src) {
-                Ok(file) => {
-                    let (tests, ctx) = scan::tests_in(&file, &path, &scan::module_base(rel), &src);
-                    contexts.extend(ctx.into_iter().map(|(module, c)| ((path.clone(), module), c)));
-                    let ranges = new_ranges.get(path.as_str()).copied().unwrap_or_default();
-                    for test in tests {
-                        let must = overlaps(ranges, test.start, test.end).then_some(Must::Changed);
-                        candidates.push(Candidate {
-                            pkg,
-                            depth,
-                            test,
-                            must,
-                            evidence: None,
-                            coverage: None,
-                            gated: false,
-                            bonus: 0.0,
-                            group: None,
-                            screen: Screen::NotAsked,
-                            judge: Judge::NotAsked,
-                            nouls: [None; 2],
-                            ranks: [None; 2],
-                            score: None,
-                            reasons: Vec::new(),
-                            selected: false,
-                        });
-                    }
-                }
-                Err(e) => whole_package(&mut out.whole, &mut out.escalations, pkg, &path, format!("does not parse: {e}")),
+            owners.push((pkg, depth));
+            paths.push(path);
+        }
+    }
+    let texts = new_src.read_many(&paths);
+    let mut kept: Vec<(usize, u32)> = Vec::with_capacity(paths.len());
+    let mut sources: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    for ((owner, path), text) in owners.into_iter().zip(paths).zip(texts) {
+        if let Some(text) = text {
+            kept.push(owner);
+            sources.push((path, text));
+        }
+    }
+    let owners = kept;
+    // One parse per file serves discovery and, when it runs, static evidence.
+    let want_evidence = sel.static_evidence != StaticEvidence::Off && !out.items.is_empty();
+    let found = parse_parallel(&sources, |i, file| {
+        let (path, src) = &sources[i];
+        let pdir = ws.packages[owners[i].0].dir.as_str();
+        let rel = if pdir.is_empty() { path.as_str() } else { &path[pdir.len() + 1..] };
+        let (tests, ctx) = scan::tests_in(file, path, &scan::module_base(rel), src);
+        (tests, ctx, want_evidence.then(|| evidence::local(file)))
+    });
+    // (file, module) → that module's context for stage-1 group questions.
+    let mut contexts: HashMap<(String, String), String> = HashMap::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut locals: Vec<Option<evidence::LocalFile>> = Vec::with_capacity(sources.len());
+    for (((pkg, depth), (path, _)), found) in owners.iter().copied().zip(&sources).zip(found) {
+        let (tests, ctx, local) = match found {
+            Ok(found) => found,
+            Err(e) => {
+                locals.push(None);
+                whole_package(&mut out.whole, &mut out.escalations, pkg, path, format!("does not parse: {e}"));
+                continue;
             }
-            proc_macro2::extra::invalidate_current_thread_spans();
-            sources.push((path, src));
+        };
+        locals.push(local);
+        contexts.extend(ctx.into_iter().map(|(module, c)| ((path.clone(), module), c)));
+        let ranges = new_ranges.get(path.as_str()).copied().unwrap_or_default();
+        for test in tests {
+            let must = overlaps(ranges, test.start, test.end).then_some(Must::Changed);
+            candidates.push(Candidate {
+                pkg,
+                depth,
+                test,
+                must,
+                evidence: None,
+                coverage: None,
+                gated: false,
+                bonus: 0.0,
+                group: None,
+                screen: Screen::NotAsked,
+                judge: Judge::NotAsked,
+                nouls: [None; 2],
+                ranks: [None; 2],
+                score: None,
+                reasons: Vec::new(),
+                selected: false,
+            });
         }
     }
     for c in &mut candidates {
@@ -604,11 +620,8 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     laps.mark("discovery");
 
     // Layer 5: static evidence.
-    if sel.static_evidence != StaticEvidence::Off && !out.items.is_empty() {
-        let files: Vec<SourceFile> = sources
-            .iter()
-            .map(|(path, src)| SourceFile { path, source: src })
-            .collect();
+    if want_evidence {
+        let files: Vec<SourceFile> = sources.iter().map(|(path, _)| SourceFile { path }).collect();
         let refs: Vec<TestRef> = candidates
             .iter()
             .map(|c| TestRef {
@@ -618,7 +631,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
                 name: c.test.name.clone(),
             })
             .collect();
-        for ev in evidence::evidence(&files, &out.items, &refs, sel.call_graph_depth) {
+        for ev in evidence::evidence(&files, locals, &out.items, &refs, sel.call_graph_depth) {
             let c = &mut candidates[ev.test];
             if c.must.is_none()
                 && sel.static_evidence == StaticEvidence::Must
@@ -806,6 +819,57 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     Ok(out)
 }
 
+/// Finds the path dependency (a crate in the repo that is not a member: a `[patch]` path, an
+/// excluded crate) a file outside every member belongs to.
+#[derive(Default)]
+struct PathDeps {
+    /// Directory → whether it holds a Cargo.toml (target side).
+    manifests: HashMap<String, bool>,
+    /// Crate directory → (package name, members depending on it); `None`: not a path dependency.
+    crates: HashMap<String, Option<(String, Vec<usize>)>>,
+    /// The target side's root Cargo.lock, read once.
+    lock: Option<Option<String>>,
+    /// `cargo metadata` path dependencies, loaded only when there is no lockfile.
+    metadata: Option<Vec<PathDep>>,
+}
+
+impl PathDeps {
+    /// The nearest ancestor directory of `path` holding a Cargo.toml names the package; the
+    /// lockfile graph (else `cargo metadata` with dependencies) says which members depend on it.
+    /// Returns (name, directory, members) when some member does.
+    fn find(&mut self, root: &Path, ws: &Workspace, src: &mut Source, path: &str) -> Option<(String, String, Vec<usize>)> {
+        let manifests = &mut self.manifests;
+        let dir = path
+            .rmatch_indices('/')
+            .map(|(i, _)| &path[..i])
+            .find(|dir| *manifests.entry((*dir).to_owned()).or_insert_with(|| src.read(&format!("{dir}/Cargo.toml")).is_some()))?;
+        if !self.crates.contains_key(dir) {
+            let found = self.lookup(root, ws, src, dir);
+            self.crates.insert(dir.to_owned(), found);
+        }
+        let (name, members) = self.crates[dir].as_ref()?;
+        (!members.is_empty()).then(|| (name.clone(), dir.to_owned(), members.clone()))
+    }
+
+    fn lookup(&mut self, root: &Path, ws: &Workspace, src: &mut Source, dir: &str) -> Option<(String, Vec<usize>)> {
+        let manifest: toml::Table = src.read(&format!("{dir}/Cargo.toml"))?.parse().ok()?;
+        let name = manifest.get("package")?.get("name")?.as_str()?.to_owned();
+        let members = match self.lock.get_or_insert_with(|| src.read("Cargo.lock")) {
+            Some(lock) => manifest::path_dependents(lock, &name, ws)?,
+            None => {
+                let deps = self.metadata.get_or_insert_with(|| {
+                    ws.path_deps(root).unwrap_or_else(|e| {
+                        eprintln!("jevtest: {e}; path dependencies count as outside every package");
+                        Vec::new()
+                    })
+                });
+                deps.iter().find(|d| d.dir == dir)?.dependents.clone()
+            }
+        };
+        Some((name, members))
+    }
+}
+
 /// Marks every test of `pkg` as must (first reason wins) and records the escalation.
 fn whole_package(whole: &mut BTreeMap<usize, String>, escalations: &mut Vec<Escalation>, pkg: usize, file: &str, why: String) {
     if let std::collections::btree_map::Entry::Vacant(slot) = whole.entry(pkg) {
@@ -966,6 +1030,41 @@ fn judge_all(
         }
     }
     Ok(())
+}
+
+/// Parses every `(path, source)` with syn on all cores and runs `f(index, file)` on each tree;
+/// a file that does not parse yields its error. Results keep the input order.
+fn parse_parallel<T: Send>(sources: &[(String, String)], f: impl Fn(usize, &syn::File) -> T + Sync) -> Vec<Result<T, String>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(sources.len()).max(1);
+    let mut out: Vec<Option<Result<T, String>>> = sources.iter().map(|_| None).collect();
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                // syn and the visitors recurse once per nesting level; give deep expressions room.
+                std::thread::Builder::new()
+                    .stack_size(32 << 20)
+                    .spawn_scoped(s, || {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((_, src)) = sources.get(i) else { break };
+                            let r = syn::parse_file(src).map(|file| f(i, &file)).map_err(|e| e.to_string());
+                            proc_macro2::extra::invalidate_current_thread_spans();
+                            done.push((i, r));
+                        }
+                        done
+                    })
+                    .expect("spawn parser thread")
+            })
+            .collect();
+        for w in workers {
+            for (i, r) in w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)) {
+                out[i] = Some(r);
+            }
+        }
+    });
+    out.into_iter().map(|r| r.unwrap_or_else(|| Err("not parsed".into()))).collect()
 }
 
 /// Repo-relative `.rs` files under package dir `pdir` that may hold its tests.

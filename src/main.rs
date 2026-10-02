@@ -457,7 +457,8 @@ fn cache_clear(g: &Global) -> Result<ExitCode, String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "json" || x == "too-large" || x == "tmp") && std::fs::remove_file(&p).is_ok() {
+            let ours = p.extension().is_some_and(|x| x == "answers" || x == "json" || x == "too-large" || x == "tmp");
+            if ours && std::fs::remove_file(&p).is_ok() {
                 removed += 1;
             }
         }

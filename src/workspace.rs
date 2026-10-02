@@ -69,7 +69,6 @@ struct Node {
 
 /// A path dependency that is not a workspace member (`[patch]` paths, excluded crates).
 pub struct PathDep {
-    pub name: String,
     /// Repo-relative manifest dir.
     pub dir: String,
     /// Members that depend on it, directly or through other packages.
@@ -182,7 +181,7 @@ impl Workspace {
                 }
             }
             dependents.sort_unstable_by(|&a, &b| self.packages[a].name.cmp(&self.packages[b].name));
-            out.push(PathDep { name: p.name.clone(), dir, dependents });
+            out.push(PathDep { dir, dependents });
         }
         Ok(out)
     }

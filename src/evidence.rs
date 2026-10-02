@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
@@ -22,7 +21,6 @@ use syn::{Attribute, Block, Expr, ImplItem, Item, Signature, TraitItem, Type};
 #[derive(Clone, Copy, Debug)]
 pub struct SourceFile<'a> {
     pub path: &'a str,
-    pub source: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -81,11 +79,13 @@ fn keyable(name: &str) -> bool {
 }
 
 /// One evidence per test that has any, strongest kind, sorted by test index.
-pub fn evidence(files: &[SourceFile], changed: &[ChangedItem], tests: &[TestRef], call_graph_depth: u8) -> Vec<Evidence> {
+/// `locals[i]` is [`local`] of `files[i]`, `None` when it does not parse (the caller's path policy
+/// already covers that file).
+pub fn evidence(files: &[SourceFile], locals: Vec<Option<LocalFile>>, changed: &[ChangedItem], tests: &[TestRef], call_graph_depth: u8) -> Vec<Evidence> {
     if changed.is_empty() || tests.is_empty() {
         return Vec::new();
     }
-    let mut g = Graph::build(files, parse_all(files));
+    let mut g = Graph::build(files, locals);
     let file_of: HashMap<&str, usize> = files.iter().enumerate().map(|(i, f)| (f.path, i)).collect();
 
     // Tests first, so they never act as intermediate callers.
@@ -471,7 +471,8 @@ fn clean_owner(owner: &str) -> &str {
 // ---------------------------------------------------------------------------------------------
 // Per-file parsing (parallel); names are file-local ids until merged.
 
-struct LocalFile {
+/// One file's names and references, built from its syntax tree by [`local`].
+pub struct LocalFile {
     ids: HashMap<String, u32>,
     nodes: Vec<RawNode>,
     /// Module scopes: index 0 is the file, then each inline `mod` with its enclosing scope.
@@ -494,44 +495,12 @@ struct RawNode {
     lasts: Vec<(u32, u32)>,
 }
 
-fn parse_all(files: &[SourceFile]) -> Vec<Option<LocalFile>> {
-    let mut out: Vec<Option<LocalFile>> = (0..files.len()).map(|_| None).collect();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(files.len()).max(1);
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                // syn and the visitor recurse once per nesting level; give deep expressions room.
-                std::thread::Builder::new()
-                    .stack_size(32 << 20)
-                    .spawn_scoped(s, || {
-                        let mut got = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(f) = files.get(i) else { break got };
-                            got.push((i, parse(f.source)));
-                            // The parsed tree is gone; free its span bookkeeping too.
-                            proc_macro2::extra::invalidate_current_thread_spans();
-                        }
-                    })
-                    .expect("spawn evidence parser thread")
-            })
-            .collect();
-        for w in workers {
-            for (i, lf) in w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)) {
-                out[i] = lf;
-            }
-        }
-    });
-    out
-}
-
-/// None when the file does not parse (the caller's path policy already covers that file).
-fn parse(src: &str) -> Option<LocalFile> {
-    let file = syn::parse_file(src).ok()?;
+/// The names and references of one parsed file, for [`evidence`]. The caller parses each file once
+/// (for test discovery too) and builds this from the same tree.
+pub fn local(file: &syn::File) -> LocalFile {
     let mut lf = LocalFile { ids: HashMap::new(), nodes: Vec::new(), parents: vec![None] };
     walk(&file.items, 0, &mut lf);
-    Some(lf)
+    lf
 }
 
 fn walk(items: &[Item], scope: u32, lf: &mut LocalFile) {

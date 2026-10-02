@@ -7,7 +7,7 @@ use globset::GlobSet;
 use serde_json::{Value, json};
 
 use crate::config::{ChangeMode, Changes};
-use crate::git::{self, Target};
+use crate::git::{self, FileChange, Target};
 
 /// An explicit choice from the command line; `None` fields fall back to `[changes]`.
 #[derive(Default)]
@@ -38,6 +38,8 @@ pub struct Scope {
     pub narrowed_from: Option<String>,
     pub files: usize,
     pub lines: usize,
+    /// The diff itself (ignored paths included), so intake does not run it again.
+    pub changes: Vec<FileChange>,
 }
 
 impl Scope {
@@ -81,11 +83,13 @@ pub fn resolve(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet) -> R
 }
 
 fn resolve_mode(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet, mode: ChangeMode) -> Result<Scope, String> {
-    let has_head = git::rev_exists(root, "HEAD");
-    let head_base = || if has_head { "HEAD".to_owned() } else { git::EMPTY_TREE.to_owned() };
+    // Asked only by the modes that need it (one git run fewer for explicit ranges).
+    let head = std::cell::OnceCell::new();
+    let has_head = || *head.get_or_init(|| git::rev_exists(root, "HEAD"));
+    let head_base = || if has_head() { "HEAD".to_owned() } else { git::EMPTY_TREE.to_owned() };
     let requested = "requested".to_owned();
     let scope = |base: String, target: Target, used, what: String, why: String| {
-        size(root, &base, &target, cfg.include_untracked, ignore).map(|(files, lines)| Scope {
+        size(root, &base, &target, cfg.include_untracked, ignore).map(|d| Scope {
             requested: "",
             base,
             target,
@@ -93,8 +97,9 @@ fn resolve_mode(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet, mod
             what,
             why,
             narrowed_from: None,
-            files,
-            lines,
+            files: d.files,
+            lines: d.lines,
+            changes: d.changes,
         })
     };
     match mode {
@@ -112,13 +117,13 @@ fn resolve_mode(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet, mod
         }
         ChangeMode::Last => {
             let n = req.last.unwrap_or(cfg.last).max(1);
-            need_head(has_head)?;
+            need_head(has_head())?;
             let base = nth_parent(root, "HEAD", n);
             scope(base, Target::Rev("HEAD".into()), "last", plural(n, "last commit", "last {n} commits"), requested)
         }
         ChangeMode::Since => {
             let when = req.since.clone().unwrap_or_else(|| cfg.since.clone());
-            need_head(has_head)?;
+            need_head(has_head())?;
             let what = format!("commits since {when}");
             match oldest_since(root, &when, "HEAD")? {
                 Some(oldest) => scope(git::parent_or_empty(root, &oldest), Target::Rev("HEAD".into()), "since", what, requested),
@@ -142,15 +147,15 @@ fn resolve_mode(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet, mod
             };
             scope(base, target, "range", what, requested)
         }
-        ChangeMode::Auto => auto(root, cfg, ignore, has_head),
+        ChangeMode::Auto => auto(root, cfg, ignore, has_head()),
     }
 }
 
 fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<Scope, String> {
     let head_base = if has_head { "HEAD".to_owned() } else { git::EMPTY_TREE.to_owned() };
-    let (files, lines) = size(root, &head_base, &Target::Worktree, cfg.include_untracked, ignore)?;
-    if files > 0 {
-        let why = if files > cfg.max_files || lines > cfg.max_lines {
+    let dirty = size(root, &head_base, &Target::Worktree, cfg.include_untracked, ignore)?;
+    if dirty.files > 0 {
+        let why = if dirty.files > cfg.max_files || dirty.lines > cfg.max_lines {
             "auto: working tree is dirty; large, but uncommitted work is never narrowed"
         } else {
             "auto: working tree is dirty"
@@ -163,15 +168,16 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             what: "uncommitted work".into(),
             why: why.into(),
             narrowed_from: None,
-            files,
-            lines,
+            files: dirty.files,
+            lines: dirty.lines,
+            changes: dirty.changes,
         });
     }
     need_head(has_head)?;
     let head = Target::Rev("HEAD".into());
     let last = || -> Result<Scope, String> {
         let base = git::parent_or_empty(root, "HEAD");
-        let (files, lines) = size(root, &base, &head, false, ignore)?;
+        let d = size(root, &base, &head, false, ignore)?;
         Ok(Scope {
             requested: "",
             base,
@@ -180,8 +186,9 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             what: "last commit".into(),
             why: String::new(),
             narrowed_from: None,
-            files,
-            lines,
+            files: d.files,
+            lines: d.lines,
+            changes: d.changes,
         })
     };
 
@@ -198,7 +205,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
     }
 
     let branch = branch_name(root);
-    let (files, lines) = size(root, &base, &head, false, ignore)?;
+    let d = size(root, &base, &head, false, ignore)?;
+    let (files, lines) = (d.files, d.lines);
     if files <= cfg.max_files && lines <= cfg.max_lines {
         return Ok(Scope {
             requested: "",
@@ -210,6 +218,7 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             narrowed_from: None,
             files,
             lines,
+            changes: d.changes,
         });
     }
 
@@ -218,8 +227,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
     let narrowed_from = Some(format!("{branch} vs {default} ({files} files, {lines} lines)"));
     if let Some(oldest) = oldest_since(root, &cfg.recent, &format!("{base}..HEAD"))? {
         let recent_base = git::parent_or_empty(root, &oldest);
-        let (f, l) = size(root, &recent_base, &head, false, ignore)?;
-        if f <= cfg.max_files && l <= cfg.max_lines {
+        let d = size(root, &recent_base, &head, false, ignore)?;
+        if d.files <= cfg.max_files && d.lines <= cfg.max_lines {
             return Ok(Scope {
                 requested: "",
                 base: recent_base,
@@ -228,8 +237,9 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
                 what: format!("commits since {}", cfg.recent),
                 why: format!("auto: {too_big}"),
                 narrowed_from,
-                files: f,
-                lines: l,
+                files: d.files,
+                lines: d.lines,
+                changes: d.changes,
             });
         }
     }
@@ -271,16 +281,24 @@ fn oldest_since(root: &Path, when: &str, range: &str) -> Result<Option<String>, 
     Ok(list.lines().last().map(str::to_owned))
 }
 
-/// Non-ignored changed files and changed lines (both sides) of `base` against `target`.
-fn size(root: &Path, base: &str, target: &Target, untracked: bool, ignore: &GlobSet) -> Result<(usize, usize), String> {
-    let files = git::changed_files(root, base, target, untracked)?;
-    let mut n = 0;
+struct Diff {
+    /// Non-ignored changed files.
+    files: usize,
+    /// Changed lines of those files, both sides.
+    lines: usize,
+    changes: Vec<FileChange>,
+}
+
+/// The diff of `base` against `target`, sized without ignored paths.
+fn size(root: &Path, base: &str, target: &Target, untracked: bool, ignore: &GlobSet) -> Result<Diff, String> {
+    let changes = git::changed_files(root, base, target, untracked)?;
+    let mut files = 0;
     let mut lines = 0;
-    for f in files.iter().filter(|f| !ignore.is_match(f.path())) {
-        n += 1;
+    for f in changes.iter().filter(|f| !ignore.is_match(f.path())) {
+        files += 1;
         for &(a, b) in f.new_ranges.iter().chain(&f.old_ranges) {
             lines += (b - a + 1) as usize;
         }
     }
-    Ok((n, lines))
+    Ok(Diff { files, lines, changes })
 }

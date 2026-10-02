@@ -47,7 +47,7 @@ Paste the printed block into `AGENTS.md` (and `CLAUDE.md` if the repo uses one).
 - Red: fix the code (or the spec, and say which) and rerun `cargo jevtest run` until it is green. Never loosen or skip a failing test.
 - Why was a test picked or skipped? `cargo jevtest explain <PATTERN>`.
 - Machine-readable selection: `cargo jevtest --format json`.
-- Changes to `Cargo.toml`, `Cargo.lock`, the toolchain or `.config/nextest.toml` escalate to the full suite on their own; let it run.
+- Toolchain and `.config/nextest.toml` changes, and `Cargo.toml`/`Cargo.lock` changes beyond version stamps and dependency bumps, escalate to the full suite on their own; let it run.
 - The full suite still runs for releases and in CI.
 <!-- /jevtest -->
 ```
@@ -74,7 +74,7 @@ Decision rules:
 - If the summary says it escalated to a full run, let it run. The reason is in the summary and in the report's escalations.
 - If it selected nothing ("nothing worth running", exit 0): the diff touched only ignored paths. Done.
 - If the stderr `jevtest: changes = …` line shows the wrong scope: pass a scope flag (next section).
-- Need more recall for a risky change: `--top-n 60 --top-fraction 0.5`, `--threshold 0.3`, or `--no-jev` (with the default `--without-jev reach`: every reached test).
+- Need more recall for a risky change: `--top-n 60 --top-fraction 0.5`, `--threshold 0.5`, or `--no-jev` (with the default `--without-jev reach`: every reached test).
 - No key and the reach-level run is too big: `--without-jev evidence` (must-runs, static evidence, rules, `tests.always` only).
 - Need it faster: `--max-tests N` (drops the lowest-scored picks that are not must-runs).
 
@@ -94,7 +94,7 @@ Pass one scope flag to choose exactly. Scope flags are mutually exclusive; `--fi
 | `--commit REV` | exactly this commit: `REV^..REV` |
 | `--since WHEN` | commits since WHEN (`today`, `midnight`, `6 hours ago`, `2026-10-01`; git date syntax) on first-parent history: base = parent of the oldest such commit, head = `HEAD` |
 | `--range A..B` / `--base A [--head B]` | explicit range; `A..` or no `--head` = against the working tree |
-| `--files PATH_OR_GLOB...` (repeatable) | restrict the scope's diff to these paths. A listed file with no diff in scope counts as wholly changed, so `--files src/x.rs` alone means "the impact of this file" |
+| `--files PATH_OR_GLOB...` (repeatable) | restrict the scope's diff to these paths, directories or globs. A listed file (not a directory, not a glob) with no diff in scope counts as wholly changed, so `--files src/x.rs` alone means "the impact of this file"; directories and globs only narrow |
 
 `--changes auto|uncommitted|staged|unstaged|branch|last|since|range` is the long form of the same choice (matches `changes.mode`).
 
@@ -163,7 +163,7 @@ Each layer records its verdict per candidate; `explain` and the JSON report show
 | # | Layer | What it does | Cost | Config keys |
 |---|---|---|---|---|
 | 1 | Intake | Diff for the chosen change scope (see [Choosing what changed](#choosing-what-changed)); changed lines on both sides; changed items from old and new source (fn, `Type::method`, struct, enum, trait, const, static, type alias, `macro_rules`, deleted items too) | git + parse | `[changes]`; scope flags |
-| 2 | Path policy | `full_run` paths → full run; `ignore` paths dropped; `[[rule]]` matches → must filtersets, whole packages or full run; non-Rust file in a package → `non_rust` policy; unparsable `.rs` → whole package | free | `paths.full_run`, `paths.ignore`, `[[rule]]`, `select.non_rust` |
+| 2 | Path policy | `full_run` paths → full run; `ignore` paths dropped; `[[rule]]` matches → must filtersets, whole packages or full run; root `Cargo.toml`/`Cargo.lock` and member manifests → [manifest semantics](#manifests-and-the-lockfile); files under a path dependency → its dependent members changed; files outside every package → `paths.outside`; non-Rust file in a package → `non_rust` policy; unparsable `.rs` → whole package | free (`cargo metadata` with dependencies only for a path dependency without a lockfile) | `paths.full_run`, `paths.ignore`, `paths.outside`, `[[rule]]`, `select.non_rust` |
 | 3 | Reach | Changed packages + reverse deps (normal, dev, build) | `cargo metadata` | `select.reach_depth` |
 | 4 | Discovery | Tests in reached packages, via `syn`, with spans and source | parse | none |
 | 5 | Static evidence | `Changed` (test's own span changed) → must. `Direct` (test names a changed item) and `Helper` (a same-module non-test fn it calls does) → must or boost. `Transitive` (reaches a changed item through the name-based call graph) → boost. Boost = skips screening, +0.2 score (cap 1.0) | parse, no model | `select.static_evidence`, `select.call_graph_depth` |
@@ -251,7 +251,7 @@ names the key.
 |---|---|---|---|
 | `top_n` | `30` | Top N tests per Jev view are selected | `--top-n N` |
 | `top_fraction` | `0.25` | ...but at most this share (0..1) of the tests a view ranked, so small pools stay narrow | `--top-fraction F` |
-| `threshold` | `0.5` | Score at or above is always selected | `--threshold F` |
+| `threshold` | `0.85` | Score at or above is always selected. The summary's `judging:` line (and the report's `picks`) says how many tests top-n and threshold each picked, and how many only one of them did, so you can tune both | `--threshold F` |
 | `group_threshold` | `0.1` | Stage-1 screening cutoff; groups with static evidence are never screened out | `--group-threshold F` |
 | `max_tests` | `0` | Cap; `0` = none. Drops lowest-scored non-must picks | `--max-tests N` |
 | `min_tests` | `0` | Pad with the next-best scores | |
@@ -268,7 +268,25 @@ names the key.
 | Key | Default | Meaning |
 |---|---|---|
 | `ignore` | `["**/*.md", "docs/**", ".github/**"]` | Changes here are ignored |
-| `full_run` | `["Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]` | Changes here escalate to the full suite |
+| `full_run` | `["rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]` | Changes here escalate to the full suite. The explicit override: list `Cargo.toml` or `Cargo.lock` here to make any change to them a full run again |
+| `outside` | `"referenced"` | A changed file outside every package and every path dependency. `referenced`: the packages whose Rust source (build.rs included; comments do not count) names it in a string literal — a word ending with its path or basename, or with two consecutive components of a parent directory, or a literal that is exactly its top-level directory when it sits directly in one (`include_str!("../../docs/openapi.json")`, `sqlx::migrate!("../../migrations")`) — run whole; files nothing names are ignored, listed on one summary line (`outside_ignored_files` in the report). `full`: any such file runs the full suite. `ignore`: such files never matter |
+
+#### Manifests and the lockfile
+
+The root `Cargo.toml`, the root `Cargo.lock` and each member's `Cargo.toml` are parsed and compared,
+old side against new; the decision is recorded in the escalations (`ignored`, `changed`, `whole`, `full`).
+
+| What changed | Decision |
+|---|---|
+| Only workspace-member versions: `[workspace.package] version`, a member's `[package] version`, `version` on a dependency entry that is a `path` to a member, members' entries in `Cargo.lock` | Ignored (release version stamps) |
+| A member's dependency tables (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[target.*.…]`) and nothing else in its manifest | That package counts as changed: reach and Jev apply; its tests carry evidence `dependency` |
+| Anything else in a member's manifest | That package runs whole |
+| External packages in `Cargo.lock` (added, removed, version, checksum or dependencies changed) | Every member depending on them, directly or transitively through the lockfile graph, counts as changed, with evidence `dependency` naming them |
+| Anything else in the root `Cargo.toml` (profiles, `[patch]`, features, `[workspace.dependencies]`, members) or the lockfile's format | Full run |
+
+A file under a path dependency that is not a member (a `[patch]` path, a crate in `workspace.exclude`)
+makes the members depending on it changed, the same way, found through `Cargo.lock`.
+
 
 ### `[[rule]]` (repeatable)
 
@@ -320,7 +338,7 @@ full = true
 | `max_test_chars` | `800` | Test source per `body` question |
 | `max_group_chars` | `600` | Group description per screening question |
 | `timeout_secs` | `30` | Jev time budget; Jev never blocks longer than this in total |
-| `cache_dir` | `"~/.cache/jevtest"` | Response cache |
+| `cache_dir` | `"~/.cache/jevtest"` | Answer cache. Each answer is keyed on its own by sha256 of the model, the change state (diff, changed packages and items) and the question; the answers to one change state share one append-only `.answers` file. Editing a `[[rule]]` or a threshold re-asks nothing already answered for the same change. Per-request cache files of jevtest 0.3.0 and earlier are ignored (`cache clear` removes them) |
 
 ### `[changes]`
 
@@ -337,7 +355,7 @@ Which changes feed selection. See [Choosing what changed](#choosing-what-changed
 | `max_files` | `60` | auto size guard: non-ignored files | |
 | `max_lines` | `3000` | auto size guard: changed lines, both sides | |
 | `include_untracked` | `true` | Untracked files count as added | |
-| `files` | `[]` | Restrict the diff to these paths/globs, like `--files` | `--files PATH_OR_GLOB` |
+| `files` | `[]` | Restrict the diff to these paths, directories or globs, like `--files`; only a listed file counts as wholly changed | `--files PATH_OR_GLOB` |
 
 ### `[coverage]`
 
@@ -359,7 +377,7 @@ or `JEVTEST_PROFILE=NAME`.
 ```toml
 [profile.ci]
 top_n = 60
-threshold = 0.3
+threshold = 0.5
 on_jev_error = "full"
 ```
 
@@ -385,9 +403,12 @@ Other: `--profile NAME`, `--config PATH`,
 
 `--json PATH` writes the full report to a file with any format. Report fields: `version`, base, head,
 `changes` (`requested`, `used`, `what`, `reason`, `base`, `head`, `files`, `lines`, `narrowed_from`),
-profile, config path, changed files, escalations, rules fired, changed and reached packages, changed
-items, per-stage Jev usage (asked, requests, splits, cache hits, input/output tokens, ms,
-`est_cost_usd`), the filter and the command, and one entry per candidate:
+profile, config path, changed files, ignored files, `outside_ignored_files`, escalations (`kind`:
+`full`, `whole`, `changed`, `ignored`), rules fired, changed, reached, whole and `dependency_packages`,
+changed items, `picks` (`top_n`, `threshold`, `only_top_n`, `only_threshold`), `filtersets_run`,
+per-stage Jev usage (asked, requests, splits, `cache_hits` = questions answered from the cache,
+input/output tokens, ms, `est_cost_usd`), `timings_ms` (wall time per layer; `-v` prints the same on
+stderr), the filter and the command, and one entry per candidate:
 
 | Field | Meaning |
 |---|---|
@@ -431,8 +452,8 @@ cargo jevtest run --profile ci --branch origin/main --json jevtest-report.json
 - Price: $0.042 per million input tokens; output tokens are free.
 - Measured on a 25-crate production Rust workspace (1,717 tests), three changes: ≈ $0.002 / $0.011 / $0.024 per uncached run (46k / 250k / 578k input tokens); Jev wall time 0.9 / 1.4 / 2.8 s.
 - Requests run in parallel (`jev.concurrency`) and batched (`jev.batch`); the diff is billed once per request.
-- Responses are cached in `~/.cache/jevtest` by request, so reruns on the same diff cost nothing.
-  Clear with `cargo jevtest cache clear`.
+- Answers are cached in `~/.cache/jevtest` per question, so reruns on the same diff cost nothing,
+  and so does re-selecting after changing `[[rule]]`s, thresholds or `top_n`. Clear with `cargo jevtest cache clear`.
 - `est_cost_usd` in the report gives the estimate for each run.
 
 ## Troubleshooting
@@ -442,7 +463,7 @@ cargo jevtest run --profile ci --branch origin/main --json jevtest-report.json
 | stderr line says Jev is skipped | No key | See [Key setup](#key-setup). Default `without_jev = "reach"` runs every reached test; `--without-jev evidence` narrows to must-runs, static evidence, rules and `tests.always` |
 | stderr notice that `cargo test` is used | `runner = "auto"` and cargo-nextest is missing | Nothing, or `cargo install cargo-nextest --locked` for faster runs and `-E` filtersets |
 | runner not found with `--runner nextest` | cargo-nextest missing | `cargo install cargo-nextest --locked`, or `--runner auto` |
-| Escalated to a full run | A `paths.full_run` path changed, a `[[rule]]` with `full = true` fired, or Jev failed with `on_jev_error = "full"` | Read the escalations in the summary or `--format json`. Expected after `Cargo.toml`/`Cargo.lock`/toolchain edits; let it run |
+| Escalated to a full run | A `paths.full_run` path changed, the root `Cargo.toml` changed beyond versions (profiles, `[patch]`, workspace dependencies), a `[[rule]]` with `full = true` fired, `paths.outside = "full"` with a file outside every package, or Jev failed with `on_jev_error = "full"` | Read the escalations in the summary or `--format json`; let it run |
 | Selection is much larger than expected | No key or `--no-jev` with `without_jev = "reach"`; Jev failed (stderr `jevtest: Jev failed: <cause>; …`) and `on_jev_error = "reach"`; or `--offline` with uncached questions (unjudged → selected) | Check the summary and `cargo jevtest doctor`; add a key, or use `--without-jev evidence` |
 | HTTP 400 `max_tokens_exceeded` in `-v` output | Request too large | Nothing: jevtest splits the batch in half recursively and caches the refusal; refusals are not charged. The report counts `splits` |
 | No network | Offline | `cargo jevtest run --offline`: cached answers are used; tests with uncached questions are unjudged and selected |

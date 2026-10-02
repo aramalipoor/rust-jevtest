@@ -163,28 +163,36 @@ pub enum WithoutJev {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Runner {
-    /// `nextest` when `cargo nextest --version` succeeds, else `cargo`.
+    /// `nextest` when cargo-nextest is installed, else `cargo`.
     Auto,
     Nextest,
     Cargo,
 }
 
 impl Runner {
-    /// Resolves [`Runner::Auto`] to `Nextest` when `$CARGO nextest --version` succeeds, else
-    /// `Cargo`; other values are returned unchanged.
+    /// Resolves [`Runner::Auto`] to `Nextest` when a `cargo-nextest` executable is where cargo
+    /// looks for subcommands (`$CARGO_HOME/bin`, then `PATH`), else `Cargo`; other values are
+    /// returned unchanged. A lookup, not a `cargo nextest --version` run (~200 ms).
     pub fn resolve(self) -> Runner {
         if self != Runner::Auto {
             return self;
         }
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let nextest = std::process::Command::new(cargo)
-            .args(["nextest", "--version"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if nextest { Runner::Nextest } else { Runner::Cargo }
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+            .map(|h| h.join("bin"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let exe = format!("cargo-nextest{}", std::env::consts::EXE_SUFFIX);
+        let found = home.into_iter().chain(std::env::split_paths(&path)).any(|dir| {
+            std::fs::metadata(dir.join(&exe)).is_ok_and(|m| {
+                #[cfg(unix)]
+                let runnable = std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0;
+                #[cfg(not(unix))]
+                let runnable = true;
+                m.is_file() && runnable
+            })
+        });
+        if found { Runner::Nextest } else { Runner::Cargo }
     }
 }
 
@@ -625,7 +633,7 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # max_test_chars = 800                                  # test source per body question, in chars
 # max_group_chars = 600                                 # group description per screening question, in chars
 # timeout_secs = 30                                     # per-request timeout, in seconds
-# cache_dir = "~/.cache/jevtest"                        # answer cache, one file per question; `cargo jevtest cache clear` empties it
+# cache_dir = "~/.cache/jevtest"                        # answer cache, per question; `cargo jevtest cache clear` empties it
 
 [coverage]
 # Per-test coverage map from `cargo jevtest coverage build` (build it nightly on the default branch).

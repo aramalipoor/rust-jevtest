@@ -254,6 +254,40 @@ impl Lock {
         }
         rev
     }
+
+    /// Member names that depend on `start`, directly or through other packages.
+    fn dependents<'a>(&'a self, rev: &HashMap<&'a Key, Vec<&'a Key>>, start: &'a Key, members: &HashSet<&str>) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<&Key> = HashSet::from([start]);
+        let mut queue: VecDeque<&Key> = VecDeque::from([start]);
+        while let Some(at) = queue.pop_front() {
+            for &up in rev.get(at).into_iter().flatten() {
+                if seen.insert(up) {
+                    if up.2.is_empty() && members.contains(up.0.as_str()) {
+                        out.push(up.0.as_str());
+                    }
+                    queue.push_back(up);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Members depending, directly or through other packages, on the path package `name`: a
+/// `Cargo.lock` entry without `source` that is not a member (`[patch]` paths, excluded crates).
+/// `None` when the lockfile has no such entry or does not parse.
+pub fn path_dependents(lock: &str, name: &str, ws: &Workspace) -> Option<Vec<usize>> {
+    let members = member_names(ws);
+    let lock = read_lock(lock, "Cargo.lock", &members).ok()?;
+    let rev = lock.reverse();
+    let mut found = false;
+    let mut out = BTreeSet::new();
+    for k in lock.entries.keys().filter(|k| k.0 == name && k.2.is_empty() && !members.contains(name)) {
+        found = true;
+        out.extend(lock.dependents(&rev, k, &members).into_iter().filter_map(|m| ws.by_name(m)));
+    }
+    found.then(|| out.into_iter().collect())
 }
 
 /// The root `Cargo.lock`.
@@ -289,17 +323,8 @@ pub fn lockfile(old: Option<&str>, new: Option<&str>, ws: &Workspace) -> Verdict
     for (lock, keys) in [(&a, &gone), (&b, &came)] {
         let rev = lock.reverse();
         for k in keys.iter().filter(|k| !is_member(k)) {
-            let mut seen: HashSet<&Key> = HashSet::from([*k]);
-            let mut queue: VecDeque<&Key> = VecDeque::from([*k]);
-            while let Some(at) = queue.pop_front() {
-                for &up in rev.get(at).into_iter().flatten() {
-                    if seen.insert(up) {
-                        if is_member(up) {
-                            hits.entry(up.0.clone()).or_default().insert(k.0.clone());
-                        }
-                        queue.push_back(up);
-                    }
-                }
+            for m in lock.dependents(&rev, k, &members) {
+                hits.entry(m.to_owned()).or_default().insert(k.0.clone());
             }
         }
     }

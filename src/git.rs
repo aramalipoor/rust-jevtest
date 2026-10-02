@@ -174,35 +174,38 @@ pub fn context_diff(root: &Path, base: &str, target: &Target, files: &[FileChang
 /// Changed files between `base` and `target`; with `untracked`, untracked `.rs` files of the
 /// working tree are added as [`Status::Untracked`] covering every line.
 pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) -> Result<Vec<FileChange>, String> {
-    let names = git(root, &diff_args(&["--name-status", "-z"], base, target))?;
+    // One git run: `--raw` lines (status and paths) first, then the `-U0` patch.
+    let out = git(root, &diff_args(&["--raw", "-p", "-U0"], base, target))?;
     let mut files = Vec::new();
-    let mut fields = names.split('\0').filter(|s| !s.is_empty());
-    while let Some(code) = fields.next() {
-        let one = |f: &mut dyn Iterator<Item = &str>| {
-            f.next()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("truncated name-status after {code}"))
+    for line in out.lines().take_while(|l| !l.starts_with("diff --git ")) {
+        // `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>[\t<new path>]`
+        let Some(raw) = line.strip_prefix(':') else { continue };
+        let mut fields = raw.split('\t');
+        let code = fields.next().and_then(|m| m.rsplit(' ').next()).unwrap_or_default();
+        let path = |p: Option<&str>| -> Result<String, String> {
+            let p = p.ok_or_else(|| format!("truncated raw diff line: {line}"))?;
+            Ok(if p.starts_with('"') { unquote(p) } else { p.to_owned() })
         };
-        let (status, old_path, new_path) = match code.as_bytes()[0] {
-            b'A' => (Status::Added, None, Some(one(&mut fields)?)),
-            b'D' => (Status::Deleted, Some(one(&mut fields)?), None),
-            b'R' => {
-                let old = one(&mut fields)?;
-                (Status::Renamed, Some(old), Some(one(&mut fields)?))
+        let (status, old_path, new_path) = match code.as_bytes().first() {
+            Some(b'A') => (Status::Added, None, Some(path(fields.next())?)),
+            Some(b'D') => (Status::Deleted, Some(path(fields.next())?), None),
+            Some(b'R') => {
+                let old = path(fields.next())?;
+                (Status::Renamed, Some(old), Some(path(fields.next())?))
             }
-            b'C' => {
-                one(&mut fields)?;
-                (Status::Added, None, Some(one(&mut fields)?))
+            Some(b'C') => {
+                fields.next();
+                (Status::Added, None, Some(path(fields.next())?))
             }
             _ => {
-                let p = one(&mut fields)?;
+                let p = path(fields.next())?;
                 (Status::Modified, Some(p.clone()), Some(p))
             }
         };
         files.push(FileChange { old_path, new_path, status, new_ranges: Vec::new(), old_ranges: Vec::new() });
     }
 
-    let hunks = parse_hunks(&git(root, &diff_args(&["-U0"], base, target))?);
+    let hunks = parse_hunks(&out);
     for f in &mut files {
         if let Some((old, new)) = hunks.get(f.path()) {
             f.old_ranges.clone_from(old);
@@ -229,7 +232,7 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
 /// Keeps the changes under `patterns` (paths, directories or globs). A pattern naming one existing
 /// file (not a directory, not a glob) that has no change in scope is added as wholly changed, so
 /// `--files src/x.rs` means "the impact of this file"; directories and globs only narrow.
-pub fn restrict(root: &Path, files: Vec<FileChange>, patterns: &[String], target: &Target) -> Result<Vec<FileChange>, String> {
+pub fn restrict(files: Vec<FileChange>, patterns: &[String], source: &mut Source) -> Result<Vec<FileChange>, String> {
     let mut b = globset::GlobSetBuilder::new();
     let mut plain: Vec<&str> = Vec::new();
     for p in patterns {
@@ -244,7 +247,6 @@ pub fn restrict(root: &Path, files: Vec<FileChange>, patterns: &[String], target
     let hit = |f: &FileChange| f.new_path.iter().chain(&f.old_path).any(|p| set.is_match(p));
     let mut kept: Vec<FileChange> = files.into_iter().filter(hit).collect();
 
-    let mut source = Source::new(root, target)?;
     for path in plain {
         if kept.iter().any(|f| f.new_path.as_deref() == Some(path)) {
             continue;
@@ -387,18 +389,25 @@ impl Source {
             Source::Rev { rev, stdin, stdout, .. } => {
                 writeln!(stdin, "{rev}:{path}").ok()?;
                 stdin.flush().ok()?;
-                let mut header = String::new();
-                stdout.read_line(&mut header).ok()?;
-                let mut fields = header.split_ascii_whitespace();
-                let (_, kind, size) = (fields.next()?, fields.next()?, fields.next());
-                let size: usize = size?.parse().ok()?;
-                let mut buf = vec![0; size + 1];
-                stdout.read_exact(&mut buf).ok()?;
-                buf.pop();
-                if kind != "blob" {
-                    return None;
-                }
-                String::from_utf8(buf).ok()
+                answer(stdout)
+            }
+        }
+    }
+
+    /// [`Source::read`] for many paths. At a revision every request is written before the
+    /// answers are read, so the batch costs one round trip to `git cat-file` instead of one per file.
+    pub fn read_many(&mut self, paths: &[String]) -> Vec<Option<String>> {
+        match self {
+            Source::Disk(root) => paths.iter().map(|p| std::fs::read_to_string(root.join(p)).ok()).collect(),
+            Source::Rev { rev, stdin, stdout, .. } => {
+                let requests: String = paths.iter().map(|p| format!("{rev}:{p}\n")).collect();
+                // A writer thread feeds cat-file while this one drains it, so neither pipe fills up.
+                std::thread::scope(|s| {
+                    let writer = s.spawn(move || stdin.write_all(requests.as_bytes()).and_then(|()| stdin.flush()));
+                    let out = paths.iter().map(|_| answer(stdout)).collect();
+                    let _ = writer.join();
+                    out
+                })
             }
         }
     }
@@ -434,6 +443,23 @@ impl Drop for Source {
             let _ = child.wait();
         }
     }
+}
+
+/// One `git cat-file --batch` answer: a blob's text, or `None` (missing, not a blob, not UTF-8).
+fn answer(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
+    let mut header = String::new();
+    stdout.read_line(&mut header).ok()?;
+    let mut fields = header.split_ascii_whitespace();
+    let (_, kind, size) = (fields.next()?, fields.next()?, fields.next());
+    // `<object> missing` has no size and no body.
+    let size: usize = size?.parse().ok()?;
+    let mut buf = vec![0; size + 1];
+    stdout.read_exact(&mut buf).ok()?;
+    buf.pop();
+    if kind != "blob" {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 fn walk_disk(root: &Path, dir: &str, out: &mut Vec<String>) {

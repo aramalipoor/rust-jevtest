@@ -61,7 +61,7 @@ Key (optional): `TYPESAFE_API_KEY`, `AI_GATEWAY_API_KEY`, or `~/.config/jevtest/
 
 - No key or Jev down → runs every test in the reached crates; never an error.
 - No cargo-nextest → falls back to `cargo test` with one notice.
-- `Cargo.toml`, `Cargo.lock` or toolchain changes → full run.
+- Toolchain changes, and `Cargo.toml`/`Cargo.lock` changes beyond version stamps and dependency bumps → full run. A dependency bump counts as a change to the crates that use it.
 - Tests you changed always run. The optional coverage map only drops tests that never run changed code.
 
 Full agent guide: [docs/agents.md](docs/agents.md) (doctor checks, key setup, the selection layers,
