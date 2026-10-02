@@ -241,9 +241,10 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
     let config = cfg.source.as_ref().map_or_else(|| "defaults".to_owned(), |p| p.display().to_string());
     let _ = writeln!(
         o,
-        "jevtest {}: {}..{}  (config {config}{})",
+        "jevtest {}: {} [{}..{}]  (config {config}{})",
         env!("CARGO_PKG_VERSION"),
-        s.base,
+        s.scope.what,
+        &s.base[..s.base.len().min(12)],
         s.target.label(),
         profile.map(|p| format!(", profile {p}")).unwrap_or_default()
     );
@@ -321,10 +322,11 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
                 );
                 let _ = writeln!(
                     o,
-                    "judging: {} tests judged in views [{}]; picked top-{} names {}, body {}, threshold(>= {}) {}, union {}; unjudged {}",
+                    "judging: {} tests judged in views [{}]; picked top-{} (at most {:.0}% per view) names {}, body {}, threshold(>= {}) {}, union {}; unjudged {}",
                     count(s, |c| c.judge == Judge::Judged),
                     cfg.jev.views.join(", "),
                     cfg.select.top_n,
+                    cfg.select.top_fraction * 100.0,
                     count(s, |c| has_reason(c, "top-n:names")),
                     count(s, |c| has_reason(c, "top-n:body")),
                     cfg.select.threshold,
@@ -460,6 +462,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
         "version": env!("CARGO_PKG_VERSION"),
         "base": s.base,
         "head": s.target.label(),
+        "changes": s.scope.report(),
         "profile": profile,
         "config": cfg.source.as_ref().map(|p| p.display().to_string()),
         "changed_files": s.files.iter().map(|f| json!({
@@ -494,6 +497,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
             "offline": offline,
             "views": cfg.jev.views,
             "top_n": cfg.select.top_n,
+            "top_fraction": cfg.select.top_fraction,
             "threshold": cfg.select.threshold,
             "group_threshold": cfg.select.group_threshold,
             "groups": s.groups.len(),
@@ -589,10 +593,11 @@ pub fn explain(s: &Selection, cfg: &Config, pattern: &str) -> String {
         let _ = writeln!(o, "  judging:    {judge}");
         let _ = writeln!(
             o,
-            "  policy:     {} [{}]  (top_n {}, threshold {})",
+            "  policy:     {} [{}]  (top_n {}, top_fraction {}, threshold {})",
             if c.selected { "SELECTED" } else { "dropped" },
             c.reasons.join(", "),
             sel.top_n,
+            sel.top_fraction,
             sel.threshold
         );
     }

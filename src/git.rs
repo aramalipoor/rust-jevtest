@@ -32,14 +32,35 @@ pub fn repo_root(dir: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot resolve repo root {}: {e}", top.display()))
 }
 
-/// `git merge-base HEAD origin/HEAD`, falling back to origin/main, then origin/master.
-pub fn default_base(root: &Path) -> Result<String, String> {
-    for upstream in ["origin/HEAD", "origin/main", "origin/master"] {
-        if let Ok(base) = git(root, &["merge-base", "HEAD", upstream]) {
-            return Ok(base.trim().to_owned());
-        }
+/// The tree object of an empty repository: the base when a range starts at the root commit.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Whether `rev` resolves to a commit.
+pub fn rev_exists(root: &Path, rev: &str) -> bool {
+    git(root, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).is_ok()
+}
+
+/// Full hash of `rev`.
+pub fn rev_parse(root: &Path, rev: &str) -> Result<String, String> {
+    Ok(git(root, &["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?.trim().to_owned())
+}
+
+/// `rev^`, or the empty tree when `rev` is a root commit.
+pub fn parent_or_empty(root: &Path, rev: &str) -> String {
+    let parent = format!("{rev}^");
+    if rev_exists(root, &parent) { parent } else { EMPTY_TREE.to_owned() }
+}
+
+/// The repository's default branch ref: `name` itself unless it is `"auto"`, which tries
+/// origin/HEAD, origin/main, origin/master, main, master. `None` when none exists.
+pub fn default_branch(root: &Path, name: &str) -> Option<String> {
+    if name != "auto" {
+        return rev_exists(root, name).then(|| name.to_owned());
     }
-    Err("no --base given and no merge-base with origin/HEAD, origin/main or origin/master".into())
+    ["origin/HEAD", "origin/main", "origin/master", "main", "master"]
+        .into_iter()
+        .find(|r| rev_exists(root, r))
+        .map(str::to_owned)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,6 +92,8 @@ pub enum Target {
     Worktree,
     /// The index (`--staged`).
     Staged,
+    /// The working tree against the index (`--unstaged`); the base is `""`, the index.
+    Unstaged,
     /// A revision (`--head`).
     Rev(String),
 }
@@ -78,7 +101,7 @@ pub enum Target {
 impl Target {
     pub fn label(&self) -> &str {
         match self {
-            Target::Worktree => "working tree",
+            Target::Worktree | Target::Unstaged => "working tree",
             Target::Staged => "index",
             Target::Rev(r) => r,
         }
@@ -124,6 +147,7 @@ fn diff_args<'a>(extra: &[&'a str], base: &'a str, target: &'a Target) -> Vec<&'
     match target {
         Target::Worktree => args.push(base),
         Target::Staged => args.extend(["--cached", base]),
+        Target::Unstaged => {}
         Target::Rev(head) => args.extend([base, head.as_str()]),
     }
     args.push("--");
@@ -186,7 +210,7 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
         }
     }
 
-    if untracked && matches!(target, Target::Worktree) {
+    if untracked && matches!(target, Target::Worktree | Target::Unstaged) {
         let list = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
         for path in list.split('\0').filter(|p| p.ends_with(".rs")) {
             let lines = std::fs::read_to_string(root.join(path)).map(|t| t.lines().count()).unwrap_or(0).max(1) as u32;
@@ -200,6 +224,39 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
         }
     }
     Ok(files)
+}
+
+/// Keeps the changes under `patterns` (paths or globs). A listed path that exists on the target
+/// side but has no change in scope is added as wholly changed, so `--files src/x.rs` means "the
+/// impact of this file".
+pub fn restrict(root: &Path, files: Vec<FileChange>, patterns: &[String], target: &Target) -> Result<Vec<FileChange>, String> {
+    let mut b = globset::GlobSetBuilder::new();
+    for p in patterns {
+        let p = p.trim_start_matches("./").trim_end_matches('/');
+        b.add(globset::Glob::new(p).map_err(|e| format!("--files: bad glob {p}: {e}"))?);
+        b.add(globset::Glob::new(&format!("{p}/**")).map_err(|e| format!("--files: bad glob {p}: {e}"))?);
+    }
+    let set = b.build().map_err(|e| e.to_string())?;
+    let hit = |f: &FileChange| f.new_path.iter().chain(&f.old_path).any(|p| set.is_match(p));
+    let mut kept: Vec<FileChange> = files.into_iter().filter(hit).collect();
+
+    let mut source = Source::new(root, target)?;
+    let all = source.list(root, "")?;
+    for path in all.iter().filter(|p| set.is_match(p.as_str())) {
+        if kept.iter().any(|f| f.new_path.as_deref() == Some(path.as_str())) {
+            continue;
+        }
+        let Some(text) = source.read(path) else { continue };
+        let lines = text.lines().count().max(1) as u32;
+        kept.push(FileChange {
+            old_path: Some(path.clone()),
+            new_path: Some(path.clone()),
+            status: Status::Modified,
+            new_ranges: vec![(1, lines)],
+            old_ranges: vec![(1, lines)],
+        });
+    }
+    Ok(kept)
 }
 
 /// Parses a `-U0` diff into path → (old ranges, new ranges); keyed by new path, or old path for deletions.
@@ -297,7 +354,7 @@ impl Source {
     /// Reads the side `target` names: disk, the index, or a revision.
     pub fn new(root: &Path, target: &Target) -> Result<Self, String> {
         match target {
-            Target::Worktree => Ok(Source::Disk(root.to_owned())),
+            Target::Worktree | Target::Unstaged => Ok(Source::Disk(root.to_owned())),
             // `:path` names the staged blob.
             Target::Staged => Self::at(root, ""),
             Target::Rev(rev) => Self::at(root, rev),

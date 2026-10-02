@@ -151,6 +151,8 @@ pub enum JevState {
 pub struct Selection {
     pub base: String,
     pub target: Target,
+    /// How the diff was chosen (`[changes]` / scope flags).
+    pub scope: crate::changes::Scope,
     pub files: Vec<FileChange>,
     pub ws: Workspace,
     pub ignored: Vec<String>,
@@ -178,7 +180,7 @@ pub struct Selection {
     pub wall_ms: u128,
 }
 
-fn globset(patterns: &[String]) -> Result<GlobSet, String> {
+pub fn globset(patterns: &[String]) -> Result<GlobSet, String> {
     let mut b = GlobSetBuilder::new();
     for p in patterns {
         b.add(GlobBuilder::new(p).literal_separator(true).build().map_err(|e| format!("bad glob {p}: {e}"))?);
@@ -190,12 +192,17 @@ fn overlaps(ranges: &[Range], start: u32, end: u32) -> bool {
     ranges.iter().any(|&(a, b)| a <= end && start <= b)
 }
 
-pub fn run(root: &Path, cfg: &Config, base: String, target: Target, sw: &Switches) -> Result<Selection, String> {
+pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switches) -> Result<Selection, String> {
     let started = Instant::now();
     let sel = &cfg.select;
+    let base = scope.base.clone();
+    let target = scope.target.clone();
 
-    // Layer 1: intake.
-    let files = git::changed_files(root, &base, &target, sel.include_untracked)?;
+    // Layer 1: intake, narrowed to `changes.files` when given.
+    let mut files = git::changed_files(root, &base, &target, cfg.changes.include_untracked)?;
+    if !cfg.changes.files.is_empty() {
+        files = git::restrict(root, files, &cfg.changes.files, &target)?;
+    }
     let ws = Workspace::load(root)?;
     let full_run = globset(&cfg.paths.full_run)?;
     let ignore = globset(&cfg.paths.ignore)?;
@@ -206,6 +213,7 @@ pub fn run(root: &Path, cfg: &Config, base: String, target: Target, sw: &Switche
     let mut out = Selection {
         base,
         target,
+        scope,
         files: Vec::new(),
         ws,
         ignored: Vec::new(),
@@ -497,7 +505,13 @@ pub fn run(root: &Path, cfg: &Config, base: String, target: Target, sw: &Switche
         }
         out.jev_error = Some(what);
     }
-    let top_n = sel.top_n;
+    // Per view, take the top `top_n`, but never more than `top_fraction` of the tests that view
+    // ranked: a fixed 30 is a narrow cut of 1,000 judged tests and half of 60.
+    let top = |view: usize| {
+        let pool = candidates.iter().filter(|c| c.ranks[view].is_some()).count();
+        sel.top_n.min((sel.top_fraction * pool as f64).ceil() as usize)
+    };
+    let top_n = [top(0), top(1)];
     let jev_off = matches!(out.jev, JevState::Off(_));
     for c in &mut candidates {
         if let Some(m) = c.must {
@@ -525,10 +539,10 @@ pub fn run(root: &Path, cfg: &Config, base: String, target: Target, sw: &Switche
             (Screen::Uncached, _) | (_, Judge::Uncached) => c.reasons.push("uncached"),
             (Screen::Failed, _) | (_, Judge::Failed) => c.reasons.push("jev-failed"),
             (_, Judge::Judged) => {
-                if c.ranks[0].is_some_and(|r| r <= top_n) {
+                if c.ranks[0].is_some_and(|r| r <= top_n[0]) {
                     c.reasons.push("top-n:names");
                 }
-                if c.ranks[1].is_some_and(|r| r <= top_n) {
+                if c.ranks[1].is_some_and(|r| r <= top_n[1]) {
                     c.reasons.push("top-n:body");
                 }
                 if c.score.is_some_and(|s| s >= sel.threshold) {

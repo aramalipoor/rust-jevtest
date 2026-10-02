@@ -25,6 +25,7 @@ pub const VIEWS: [&str; 2] = ["names", "body"];
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub select: Select,
+    pub changes: Changes,
     pub paths: Paths,
     pub rules: Vec<Rule>,
     pub tests: Tests,
@@ -36,9 +37,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Select {
-    pub base: String,
-    pub include_untracked: bool,
     pub top_n: usize,
+    pub top_fraction: f64,
     pub threshold: f64,
     pub group_threshold: f64,
     pub max_tests: usize,
@@ -55,9 +55,8 @@ pub struct Select {
 impl Default for Select {
     fn default() -> Self {
         Self {
-            base: "auto".into(),
-            include_untracked: true,
             top_n: 30,
+            top_fraction: 0.25,
             threshold: 0.5,
             group_threshold: 0.1,
             max_tests: 0,
@@ -71,6 +70,60 @@ impl Default for Select {
             runner: Runner::Auto,
         }
     }
+}
+
+/// Which changes feed impact detection (`[changes]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Changes {
+    pub mode: ChangeMode,
+    pub default_branch: String,
+    pub base: String,
+    pub last: usize,
+    pub since: String,
+    pub recent: String,
+    pub max_files: usize,
+    pub max_lines: usize,
+    pub include_untracked: bool,
+    pub files: Vec<String>,
+}
+
+impl Default for Changes {
+    fn default() -> Self {
+        Self {
+            mode: ChangeMode::Auto,
+            default_branch: "auto".into(),
+            base: String::new(),
+            last: 1,
+            since: "midnight".into(),
+            recent: "midnight".into(),
+            max_files: 60,
+            max_lines: 3000,
+            include_untracked: true,
+            files: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangeMode {
+    /// Uncommitted work if dirty; else the branch vs the default branch; else the last commit.
+    Auto,
+    /// Staged + unstaged + untracked vs HEAD.
+    Uncommitted,
+    /// The index vs HEAD.
+    Staged,
+    /// The working tree vs the index.
+    Unstaged,
+    /// merge-base(default branch, HEAD) .. working tree.
+    Branch,
+    /// The last `changes.last` commits.
+    Last,
+    /// Commits since `changes.since`.
+    Since,
+    /// `changes.base` .. HEAD or the working tree.
+    Range,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +307,7 @@ struct File {
     paths: Paths,
     #[serde(rename = "rule")]
     rules: Vec<Rule>,
+    changes: Changes,
     tests: Tests,
     jev: Jev,
     profile: BTreeMap<String, toml::Table>,
@@ -294,6 +348,7 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>, profile: Option<&str>) ->
 
     let mut config = Config {
         select: file.select,
+        changes: file.changes,
         paths: file.paths,
         rules: file.rules,
         tests: file.tests,
@@ -311,13 +366,22 @@ impl Config {
     /// applying CLI overrides to reject bad flag values.
     pub fn validate(&self) -> Result<(), String> {
         let s = &self.select;
-        for (key, value) in [("threshold", s.threshold), ("group_threshold", s.group_threshold)] {
+        for (key, value) in [("threshold", s.threshold), ("group_threshold", s.group_threshold), ("top_fraction", s.top_fraction)] {
             if !(0.0..=1.0).contains(&value) {
                 return Err(format!("select.{key} = {value} is outside 0..=1"));
             }
         }
-        if s.base.trim().is_empty() {
-            return Err("select.base is empty (use \"auto\" or a revision)".into());
+        let c = &self.changes;
+        if c.last == 0 {
+            return Err("changes.last must be at least 1".into());
+        }
+        if c.mode == ChangeMode::Range && c.base.trim().is_empty() {
+            return Err("changes.mode = \"range\" needs changes.base (or --base / --range)".into());
+        }
+        for (key, value) in [("since", &c.since), ("recent", &c.recent), ("default_branch", &c.default_branch)] {
+            if value.trim().is_empty() {
+                return Err(format!("changes.{key} is empty"));
+            }
         }
         if s.max_tests != 0 && s.min_tests > s.max_tests {
             return Err(format!("select.min_tests ({}) exceeds select.max_tests ({})", s.min_tests, s.max_tests));
@@ -355,26 +419,30 @@ impl Config {
     }
 }
 
-/// Overlays a `[profile.X]` table: each key replaces the same-named key of `[select]`, `[tests]`
-/// or `[jev]` (key sets are disjoint).
+/// Overlays a `[profile.X]` table: each key replaces the same-named key of `[select]`,
+/// `[changes]`, `[tests]` or `[jev]` (key sets are disjoint).
 fn apply_profile(file: &mut File, overlay: toml::Table) -> Result<(), String> {
     let mut select = toml::Table::try_from(&file.select).map_err(|e| e.to_string())?;
+    let mut changes = toml::Table::try_from(&file.changes).map_err(|e| e.to_string())?;
     let mut tests = toml::Table::try_from(&file.tests).map_err(|e| e.to_string())?;
     let mut jev = toml::Table::try_from(&file.jev).map_err(|e| e.to_string())?;
     for (key, value) in overlay {
         let section = if select.contains_key(&key) {
             &mut select
+        } else if changes.contains_key(&key) {
+            &mut changes
         } else if tests.contains_key(&key) {
             &mut tests
         } else if jev.contains_key(&key) {
             &mut jev
         } else {
-            return Err(format!("unknown key `{key}` (profiles take [select], [tests] and [jev] keys)"));
+            return Err(format!("unknown key `{key}` (profiles take [select], [changes], [tests] and [jev] keys)"));
         };
         section.insert(key, value);
     }
     let fix = |e: toml::de::Error| e.to_string().trim_end().replace('\n', " ");
     file.select = select.try_into().map_err(fix)?;
+    file.changes = changes.try_into().map_err(fix)?;
     file.tests = tests.try_into().map_err(fix)?;
     file.jev = jev.try_into().map_err(fix)?;
     Ok(())
@@ -426,10 +494,27 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # Precedence: built-in defaults < this file < [profile.NAME] < command-line flags.
 # Unknown keys are an error.
 
+[changes]
+# What counts as "the change" whose impact is tested. Flags override: --uncommitted, --staged,
+# --unstaged, --branch [BASE], --last N, --commit REV, --since WHEN, --range A..B / --base A [--head B],
+# and --files PATH (narrows any of them).
+# mode = "auto"               # auto | uncommitted | staged | unstaged | branch | last | since | range
+#                             # auto: uncommitted work if the tree is dirty; else the branch vs the default
+#                             # branch when HEAD is off it; else the last commit. A committed diff larger than
+#                             # max_files/max_lines narrows to commits since `recent`, then to the last commit.
+# default_branch = "auto"     # auto = origin/HEAD, origin/main, origin/master, main, master
+# base = ""                   # mode = "range": the base revision
+# last = 1                    # mode = "last": how many commits
+# since = "midnight"          # mode = "since": git date ("midnight", "6 hours ago", "2026-10-01")
+# recent = "midnight"         # auto's fallback window when the committed diff is too large
+# max_files = 60              # auto size guard: changed files (ignored paths not counted)
+# max_lines = 3000            # auto size guard: changed lines, both sides
+# include_untracked = true    # untracked .rs files count as added (modes that include the working tree)
+# files = []                  # only these paths/globs; a listed file with no diff counts as wholly changed
+
 [select]
-# base = "auto"               # diff base; auto = merge-base(HEAD, origin/HEAD | origin/main | origin/master)
-# include_untracked = true    # untracked .rs files count as added (working-tree mode only)
 # top_n = 30                  # tests taken from the top of each Jev view
+# top_fraction = 0.25         # ...but at most this share (0..1) of the tests that view ranked
 # threshold = 0.5             # a test scoring at or above this (0..1) is always selected
 # group_threshold = 0.1       # stage-1 screening cutoff per module group; groups with static evidence are kept
 # max_tests = 0               # cap on selected tests (0 = no cap); drops the lowest-scored non-must picks

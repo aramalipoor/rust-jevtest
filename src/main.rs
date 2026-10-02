@@ -1,6 +1,7 @@
 // `cargo jevtest`: pick the Rust tests worth running for a git diff.
 // Also built as the standalone `jevtest` binary (src/bin/jevtest.rs includes this file).
 
+mod changes;
 mod config;
 mod evidence;
 mod git;
@@ -17,8 +18,7 @@ use std::time::Instant;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
-use config::{Config, Runner, WithoutJev};
-use git::Target;
+use config::{ChangeMode, Config, Runner, WithoutJev};
 
 /// Run only the Rust tests your change can break: crate reach, static evidence and TypeSafe Jev
 /// judgments, as a cargo-nextest (or cargo test) command.
@@ -80,15 +80,43 @@ enum Format {
 
 #[derive(Args)]
 struct Global {
-    /// Base revision (config `select.base`; default: merge-base with origin/HEAD, origin/main or origin/master).
+    /// What counts as the change (config `changes.mode`, default auto: uncommitted work if dirty,
+    /// else the branch vs the default branch, else the last commit; big diffs narrow to today).
+    #[arg(long, global = true, value_enum, value_name = "MODE")]
+    changes: Option<ChangeMode>,
+    /// Uncommitted work: staged + unstaged + untracked vs HEAD.
+    #[arg(long, global = true, group = "scope")]
+    uncommitted: bool,
+    /// Staged changes only (the index vs HEAD).
+    #[arg(long, global = true, group = "scope")]
+    staged: bool,
+    /// Unstaged changes only (the working tree vs the index).
+    #[arg(long, global = true, group = "scope")]
+    unstaged: bool,
+    /// The branch since it left BASE (default: the default branch), plus uncommitted work.
+    #[arg(long, global = true, group = "scope", value_name = "BASE", num_args = 0..=1, default_missing_value = "")]
+    branch: Option<String>,
+    /// The last N commits.
+    #[arg(long, global = true, group = "scope", value_name = "N")]
+    last: Option<usize>,
+    /// Exactly this commit.
+    #[arg(long, global = true, group = "scope", value_name = "REV")]
+    commit: Option<String>,
+    /// Commits since WHEN (git date: today, midnight, "6 hours ago", 2026-10-01).
+    #[arg(long, global = true, group = "scope", value_name = "WHEN")]
+    since: Option<String>,
+    /// An explicit range A..B (or A.. for A against the working tree).
+    #[arg(long, global = true, group = "scope", value_name = "A..B")]
+    range: Option<String>,
+    /// Range base (config `changes.base`); with --head, the range is BASE..HEAD.
     #[arg(long, global = true, value_name = "REV")]
     base: Option<String>,
-    /// Head revision (default: the working tree, including untracked .rs files).
-    #[arg(long, global = true, value_name = "REV")]
+    /// Range head (default: the working tree, including untracked .rs files).
+    #[arg(long, global = true, value_name = "REV", requires = "base")]
     head: Option<String>,
-    /// Compare the base with the index instead of the working tree.
-    #[arg(long, global = true)]
-    staged: bool,
+    /// Only these paths or globs (repeatable); a listed file with no diff counts as wholly changed.
+    #[arg(long, global = true, value_name = "PATH", num_args = 1..)]
+    files: Vec<String>,
     /// Config profile ([profile.NAME]); also env JEVTEST_PROFILE.
     #[arg(long, global = true, value_name = "NAME")]
     profile: Option<String>,
@@ -110,6 +138,9 @@ struct Global {
     /// Tests taken from the top of each Jev view.
     #[arg(long, global = true, value_name = "N")]
     top_n: Option<usize>,
+    /// Cap each view's top picks at this share (0..1) of the tests it ranked.
+    #[arg(long, global = true, value_name = "F")]
+    top_fraction: Option<f64>,
     /// Score at or above which a judged test is always selected.
     #[arg(long, global = true, value_name = "F")]
     threshold: Option<f64>,
@@ -175,15 +206,60 @@ fn profile(g: &Global) -> Option<String> {
     g.profile.clone().or_else(|| std::env::var("JEVTEST_PROFILE").ok().filter(|p| !p.is_empty()))
 }
 
+/// The change scope the flags ask for; flags without one leave `[changes]` in charge.
+fn change_request(g: &Global) -> Result<changes::Request, String> {
+    let mut r = changes::Request { mode: g.changes, ..Default::default() };
+    let mut set = |mode| r.mode = Some(mode);
+    if g.uncommitted {
+        set(ChangeMode::Uncommitted);
+    } else if g.staged {
+        set(ChangeMode::Staged);
+    } else if g.unstaged {
+        set(ChangeMode::Unstaged);
+    } else if g.branch.is_some() {
+        set(ChangeMode::Branch);
+    } else if g.last.is_some() {
+        set(ChangeMode::Last);
+    } else if g.commit.is_some() {
+        set(ChangeMode::Range);
+    } else if g.since.is_some() {
+        set(ChangeMode::Since);
+    } else if g.range.is_some() || g.base.is_some() {
+        set(ChangeMode::Range);
+    }
+    r.branch_base = g.branch.clone().filter(|b| !b.is_empty());
+    r.last = g.last;
+    r.commit = g.commit.clone();
+    r.since = g.since.clone();
+    r.base = g.base.clone();
+    r.head = g.head.clone();
+    if let Some(range) = &g.range {
+        if g.base.is_some() {
+            return Err("--range and --base exclude each other".into());
+        }
+        let (a, b) = range.split_once("..").ok_or("--range takes A..B (or A.. for the working tree)")?;
+        let b = b.trim_start_matches('.');
+        r.base = Some(a.to_owned());
+        r.head = (!b.is_empty()).then(|| b.to_owned());
+    }
+    if r.mode.is_some() && r.mode != Some(ChangeMode::Range) && (g.base.is_some() || g.head.is_some()) {
+        return Err("--base/--head only go with --range-style scopes, not with --uncommitted, --staged, --unstaged, --branch, --last, --commit or --since".into());
+    }
+    Ok(r)
+}
+
 /// Config with CLI overrides applied and validated.
 fn load_config(root: &Path, g: &Global) -> Result<Config, String> {
     let mut cfg = config::load(root, g.config.as_deref(), profile(g).as_deref())?;
-    let s = &mut cfg.select;
-    if let Some(v) = &g.base {
-        s.base = v.clone();
+    if !g.files.is_empty() {
+        cfg.changes.files.clone_from(&g.files);
     }
+    let s = &mut cfg.select;
     if let Some(v) = g.top_n {
         s.top_n = v;
+    }
+    if let Some(v) = g.top_fraction {
+        s.top_fraction = v;
     }
     if let Some(v) = g.threshold {
         s.threshold = v;
@@ -227,17 +303,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     if cfg.select.runner == Runner::Auto && runner == Runner::Cargo {
         eprintln!("jevtest: cargo-nextest not found; running cargo test (install: cargo install cargo-nextest --locked)");
     }
-    if g.head.is_some() && g.staged {
-        return Err("--head and --staged exclude each other".into());
-    }
-    let target = match (&g.head, g.staged) {
-        (Some(h), _) => Target::Rev(h.clone()),
-        (None, true) => Target::Staged,
-        (None, false) => Target::Worktree,
-    };
-    let base = if cfg.select.base == "auto" { git::default_base(&root)? } else { cfg.select.base.clone() };
+    let req = change_request(g)?;
+    let ignore = select::globset(&cfg.paths.ignore)?;
+    let scope = changes::resolve(&root, &cfg.changes, &req, &ignore)?;
+    eprintln!("{}", scope.line());
     let sw = select::Switches { no_jev: g.no_jev, offline: g.offline };
-    let s = select::run(&root, &cfg, base, target, &sw)?;
+    let s = select::run(&root, &cfg, scope, &sw)?;
     let extra: &[String] = match &cli.cmd {
         Some(Cmd::Run { args }) => args,
         _ => &[],
@@ -379,9 +450,12 @@ fn doctor(g: &Global) -> Result<ExitCode, String> {
             return Ok(ExitCode::from(1));
         }
     };
-    match git::default_base(&root) {
-        Ok(b) => line(Some(true), "base", format!("auto base = {}", &b[..b.len().min(12)])),
-        Err(e) => line(None, "base", format!("{e}; pass --base")),
+    match load_config(&root, g).and_then(|cfg| {
+        let ignore = select::globset(&cfg.paths.ignore)?;
+        changes::resolve(&root, &cfg.changes, &change_request(g)?, &ignore)
+    }) {
+        Ok(scope) => line(Some(true), "changes", scope.line().trim_start_matches("jevtest: changes = ").to_owned()),
+        Err(e) => line(None, "changes", format!("{e}; pick one with --uncommitted, --branch, --last N or --range A..B")),
     }
     let started = Instant::now();
     match workspace::Workspace::load(&root) {
