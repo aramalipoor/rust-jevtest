@@ -144,6 +144,21 @@ fn collect_tests(
     }
 }
 
+/// What a named item is, for the coverage layer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Kind {
+    /// A fn or method with a body; `konst` for a `const fn` (it may run at compile time).
+    Fn { konst: bool },
+    /// An impl block's own lines (header, where clause, braces): the names of its methods.
+    Impl { methods: Vec<String> },
+    /// Anything else that holds no executable body of its own: `struct`, `trait`, `const`, ...
+    Other(&'static str),
+    /// A test fn: shown, but never a changed item.
+    Test,
+    /// An inline module: shown, but never a changed item.
+    Mod,
+}
+
 /// A named item and its line span.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Named {
@@ -153,26 +168,100 @@ pub struct Named {
     pub name: String,
     /// The impl or trait type a method, const or associated type belongs to.
     pub owner: Option<String>,
-    /// A test fn or an inline module: shown, but never a changed item for static evidence.
-    pub container_or_test: bool,
-    start: u32,
-    end: u32,
+    pub kind: Kind,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Named {
+    /// `Owner::name` or `name`: the key the coverage map stores functions under.
+    pub fn key(&self) -> String {
+        item_key(self.owner.as_deref(), &self.name)
+    }
+}
+
+pub fn item_key(owner: Option<&str>, name: &str) -> String {
+    match owner {
+        Some(o) => format!("{o}::{name}"),
+        None => name.to_owned(),
+    }
 }
 
 /// The innermost named item enclosing each line of `ranges` (deduplicated, in line order).
 /// Lines outside every item yield a single `None`.
 pub fn items_at(file: &syn::File, base: &[String], ranges: &[(u32, u32)]) -> Vec<Option<Named>> {
-    let mut named = Vec::new();
-    let mut module = base.to_vec();
-    collect_named(&file.items, &mut module, &mut named);
+    let named = named(file, base);
     let mut out: Vec<Option<Named>> = Vec::new();
     for l in ranges.iter().flat_map(|&(a, b)| a..=b) {
-        let found = named.iter().filter(|n| n.start <= l && l <= n.end).min_by_key(|n| n.end - n.start);
+        let found = innermost(&named, l);
         if !out.iter().any(|o| o.as_ref() == found) {
             out.push(found.cloned());
         }
     }
     out
+}
+
+/// Every named item of a file, outermost first.
+pub fn named(file: &syn::File, base: &[String]) -> Vec<Named> {
+    let mut named = Vec::new();
+    let mut module = base.to_vec();
+    collect_named(&file.items, &mut module, &mut named);
+    named
+}
+
+/// The smallest item enclosing line `l`; on a tie (one-line items) the most deeply nested.
+pub fn innermost(named: &[Named], l: u32) -> Option<&Named> {
+    named.iter().rev().filter(|n| n.start <= l && l <= n.end).min_by_key(|n| n.end - n.start)
+}
+
+/// Changed lines that sit outside every item, or directly inside an inline module.
+#[derive(Default)]
+pub struct Loose {
+    /// The first such line that is code other than a private `use`: `pub use`, `mod x;`, an
+    /// attribute, an item macro. Coverage cannot see what it changes.
+    pub code: Option<u32>,
+    /// Some such line belongs to a private `use`: it can change name resolution in this module
+    /// and its children only.
+    pub private_use: bool,
+}
+
+/// Classifies the changed lines of `ranges` that no fn, type or impl encloses; blank and comment
+/// lines are skipped.
+pub fn loose_lines(file: &syn::File, src: &str, ranges: &[(u32, u32)]) -> Loose {
+    let named = named(file, &[]);
+    let mut uses: Vec<(u32, u32)> = Vec::new();
+    private_uses(&file.items, &mut uses);
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Loose::default();
+    for l in ranges.iter().flat_map(|&(a, b)| a..=b) {
+        if innermost(&named, l).is_some_and(|n| n.kind != Kind::Mod) {
+            continue;
+        }
+        let text = lines.get(l as usize - 1).map_or("", |s| s.trim());
+        if text.is_empty() || ["//", "/*", "*"].iter().any(|p| text.starts_with(p)) {
+            continue;
+        }
+        if uses.iter().any(|&(a, b)| a <= l && l <= b) {
+            out.private_use = true;
+        } else if out.code.is_none() {
+            out.code = Some(l);
+        }
+    }
+    out
+}
+
+fn private_uses(items: &[Item], out: &mut Vec<(u32, u32)>) {
+    for item in items {
+        match item {
+            Item::Use(u) if matches!(u.vis, syn::Visibility::Inherited) => out.push((line(u.span()), end_line(u.span()))),
+            Item::Mod(m) => {
+                if let Some((_, items)) = &m.content {
+                    private_uses(items, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn qualified(module: &[String], name: &str) -> String {
@@ -192,7 +281,7 @@ fn self_type_name(ty: &Type) -> String {
 }
 
 fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>) {
-    let push = |out: &mut Vec<Named>, module: &[String], owner: Option<&str>, name: String, span: Span, special: bool| {
+    let push = |out: &mut Vec<Named>, module: &[String], owner: Option<&str>, name: String, span: Span, kind: Kind| {
         let shown = match owner {
             Some(o) => format!("{o}::{name}"),
             None => name.clone(),
@@ -201,51 +290,61 @@ fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>)
             path: qualified(module, &shown),
             name: name.trim_end_matches('!').to_owned(),
             owner: owner.map(str::to_owned),
-            container_or_test: special,
+            kind,
             start: line(span),
             end: end_line(span),
         });
     };
+    let fn_kind = |sig: &syn::Signature| Kind::Fn { konst: sig.constness.is_some() };
     for item in items {
         match item {
-            Item::Fn(f) => push(out, module, None, ident_name(&f.sig.ident), f.span(), is_test(&f.attrs)),
-            Item::Struct(s) => push(out, module, None, ident_name(&s.ident), s.span(), false),
-            Item::Enum(e) => push(out, module, None, ident_name(&e.ident), e.span(), false),
-            Item::Union(u) => push(out, module, None, ident_name(&u.ident), u.span(), false),
-            Item::Const(c) => push(out, module, None, ident_name(&c.ident), c.span(), false),
-            Item::Static(s) => push(out, module, None, ident_name(&s.ident), s.span(), false),
-            Item::Type(t) => push(out, module, None, ident_name(&t.ident), t.span(), false),
+            Item::Fn(f) => {
+                let kind = if is_test(&f.attrs) { Kind::Test } else { fn_kind(&f.sig) };
+                push(out, module, None, ident_name(&f.sig.ident), f.span(), kind);
+            }
+            Item::Struct(s) => push(out, module, None, ident_name(&s.ident), s.span(), Kind::Other("struct")),
+            Item::Enum(e) => push(out, module, None, ident_name(&e.ident), e.span(), Kind::Other("enum")),
+            Item::Union(u) => push(out, module, None, ident_name(&u.ident), u.span(), Kind::Other("union")),
+            Item::Const(c) => push(out, module, None, ident_name(&c.ident), c.span(), Kind::Other("const")),
+            Item::Static(s) => push(out, module, None, ident_name(&s.ident), s.span(), Kind::Other("static")),
+            Item::Type(t) => push(out, module, None, ident_name(&t.ident), t.span(), Kind::Other("type alias")),
             Item::Macro(m) => {
                 if let Some(ident) = &m.ident
                     && m.mac.path.is_ident("macro_rules")
                 {
-                    push(out, module, None, format!("{}!", ident_name(ident)), m.span(), false);
+                    push(out, module, None, format!("{}!", ident_name(ident)), m.span(), Kind::Other("macro_rules"));
                 }
             }
             Item::Trait(t) => {
                 let tn = ident_name(&t.ident);
-                push(out, module, None, tn.clone(), t.span(), false);
+                push(out, module, None, tn.clone(), t.span(), Kind::Other("trait"));
                 for ti in &t.items {
-                    let (name, span) = match ti {
-                        TraitItem::Fn(f) => (&f.sig.ident, f.span()),
-                        TraitItem::Const(c) => (&c.ident, c.span()),
-                        TraitItem::Type(ty) => (&ty.ident, ty.span()),
+                    let (name, span, kind) = match ti {
+                        TraitItem::Fn(f) if f.default.is_some() => (&f.sig.ident, f.span(), fn_kind(&f.sig)),
+                        TraitItem::Fn(f) => (&f.sig.ident, f.span(), Kind::Other("trait fn signature")),
+                        TraitItem::Const(c) => (&c.ident, c.span(), Kind::Other("associated const")),
+                        TraitItem::Type(ty) => (&ty.ident, ty.span(), Kind::Other("associated type")),
                         _ => continue,
                     };
-                    push(out, module, Some(&tn), ident_name(name), span, false);
+                    push(out, module, Some(&tn), ident_name(name), span, kind);
                 }
             }
             Item::Impl(imp) => {
                 let tn = self_type_name(&imp.self_ty);
-                push(out, module, None, tn.clone(), imp.span(), false);
+                let methods = imp
+                    .items
+                    .iter()
+                    .filter_map(|ii| if let ImplItem::Fn(f) = ii { Some(ident_name(&f.sig.ident)) } else { None })
+                    .collect();
+                push(out, module, None, tn.clone(), imp.span(), Kind::Impl { methods });
                 for ii in &imp.items {
-                    let (name, span) = match ii {
-                        ImplItem::Fn(f) => (&f.sig.ident, f.span()),
-                        ImplItem::Const(c) => (&c.ident, c.span()),
-                        ImplItem::Type(ty) => (&ty.ident, ty.span()),
+                    let (name, span, kind) = match ii {
+                        ImplItem::Fn(f) => (&f.sig.ident, f.span(), fn_kind(&f.sig)),
+                        ImplItem::Const(c) => (&c.ident, c.span(), Kind::Other("associated const")),
+                        ImplItem::Type(ty) => (&ty.ident, ty.span(), Kind::Other("associated type")),
                         _ => continue,
                     };
-                    push(out, module, Some(&tn), ident_name(name), span, false);
+                    push(out, module, Some(&tn), ident_name(name), span, kind);
                 }
             }
             Item::Mod(m) => {
@@ -256,7 +355,7 @@ fn collect_named(items: &[Item], module: &mut Vec<String>, out: &mut Vec<Named>)
                         path: qualified(module, &name),
                         name: name.clone(),
                         owner: None,
-                        container_or_test: true,
+                        kind: Kind::Mod,
                         start,
                         end: end_line(brace.span.close()),
                     });

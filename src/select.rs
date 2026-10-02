@@ -8,7 +8,8 @@ use std::time::Instant;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::{Value, json};
 
-use crate::config::{Config, NonRust, OnJevError, StaticEvidence, WithoutJev};
+use crate::config::{Config, CoveragePolicy, NonRust, OnJevError, StaticEvidence, WithoutJev};
+use crate::coverage::{self, COVER_BOOST, LooseFile};
 use crate::evidence::{self, ChangedItem, EvidenceKind, SourceFile, TestRef};
 use crate::git::{self, FileChange, Range, Source, Status, Target};
 use crate::jev::{self, Answer, Usage};
@@ -35,6 +36,8 @@ pub enum Must {
     Direct,
     /// A same-module helper it calls names a changed item (`static_evidence = "must"`).
     Helper,
+    /// The coverage map says it executes a changed function (`coverage.policy = "must"`).
+    Covered,
 }
 
 impl Must {
@@ -44,6 +47,7 @@ impl Must {
             Must::Package => "package",
             Must::Direct => "direct",
             Must::Helper => "helper",
+            Must::Covered => "covered",
         }
     }
 }
@@ -53,7 +57,13 @@ pub fn evidence_kind(kind: EvidenceKind) -> String {
         EvidenceKind::Direct => "direct".into(),
         EvidenceKind::Helper => "helper".into(),
         EvidenceKind::Transitive(d) => format!("transitive({d})"),
+        EvidenceKind::Covered(n) => format!("covered({n})"),
     }
+}
+
+/// Static evidence (from source), as opposed to the coverage map's `Covered`.
+pub fn is_static(kind: EvidenceKind) -> bool {
+    !matches!(kind, EvidenceKind::Covered(_))
 }
 
 /// Stage-1 (screening) verdict.
@@ -92,6 +102,14 @@ pub struct Candidate {
     pub test: TestFn,
     pub must: Option<Must>,
     pub evidence: Option<(EvidenceKind, Vec<String>)>,
+    /// `None`: the coverage map does not know the test (or there is no map); else the changed
+    /// functions it executes.
+    pub coverage: Option<Vec<String>>,
+    /// Dropped by the coverage gate before Jev.
+    pub gated: bool,
+    /// Ranking bonus: [`BOOST`] for static evidence, [`COVER_BOOST`] for coverage under
+    /// `policy = "boost"`; a test with a bonus skips screening.
+    pub bonus: f64,
     pub group: Option<usize>,
     pub screen: Screen,
     pub judge: Judge,
@@ -105,7 +123,7 @@ pub struct Candidate {
 
 impl Candidate {
     pub fn boost(&self) -> f64 {
-        if self.evidence.is_some() && self.must.is_none() { BOOST } else { 0.0 }
+        self.bonus
     }
 
     /// Ordering key for `max_tests` / `min_tests`: score, else group Noul, else the boost.
@@ -177,6 +195,8 @@ pub struct Selection {
     pub full: Option<String>,
     /// Nextest filtersets OR'ed in by fired rules.
     pub rule_runs: Vec<String>,
+    /// The coverage layer's map, policy and verdicts.
+    pub coverage: coverage::State,
     pub wall_ms: u128,
 }
 
@@ -209,6 +229,9 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     let rule_sets: Vec<GlobSet> = cfg.rules.iter().map(|r| globset(&r.when)).collect::<Result<_, _>>()?;
     let mut new_src = Source::new(root, &target)?;
     let mut old_src: Option<Source> = None;
+    let (cov_map, cov_state) = coverage::open(root, &cfg.coverage, &base);
+    // Changed lines outside items, per file side; only the coverage layer reads them.
+    let mut loose: Vec<LooseFile> = Vec::new();
 
     let mut out = Selection {
         base,
@@ -231,6 +254,7 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         jev_error: None,
         full: None,
         rule_runs: Vec::new(),
+        coverage: cov_state,
         wall_ms: 0,
     };
     let ws = &out.ws;
@@ -303,10 +327,15 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         if let (Some(pkg), Some(path)) = (rust_new, f.new_path.as_deref()) {
             let pdir = &ws.packages[pkg].dir;
             let rel = if pdir.is_empty() { path } else { &path[pdir.len() + 1..] };
-            match new_src.read(path).map(|src| syn::parse_file(&src)) {
+            let src = new_src.read(path);
+            match src.as_deref().map(syn::parse_file) {
                 Some(Ok(file)) => {
                     let found = scan::items_at(&file, &scan::module_base(rel), &f.new_ranges);
                     record_items(&mut out.symbols, &mut out.items, &mut seen_items, ws, pkg, &item_path, path, found, "");
+                    if cov_map.is_some() {
+                        let lines = scan::loose_lines(&file, src.as_deref().unwrap_or_default(), &f.new_ranges);
+                        loose.push(LooseFile { pkg, path: path.to_owned(), loose: lines });
+                    }
                 }
                 Some(Err(e)) => {
                     let at = e.span().start();
@@ -326,10 +355,15 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
             }
             let pdir = &ws.packages[pkg].dir;
             let rel = if pdir.is_empty() { path } else { &path[pdir.len() + 1..] };
-            if let Some(Ok(file)) = old_src.as_mut().and_then(|s| s.read(path)).map(|src| syn::parse_file(&src)) {
+            let src = old_src.as_mut().and_then(|s| s.read(path));
+            if let Some(Ok(file)) = src.as_deref().map(syn::parse_file) {
                 let found = scan::items_at(&file, &scan::module_base(rel), &f.old_ranges);
                 let tag = if f.status == Status::Deleted { " (deleted file)" } else { " (old side)" };
                 record_items(&mut out.symbols, &mut out.items, &mut seen_items, ws, pkg, &item_path, path, found, tag);
+                if cov_map.is_some() {
+                    let lines = scan::loose_lines(&file, src.as_deref().unwrap_or_default(), &f.old_ranges);
+                    loose.push(LooseFile { pkg, path: path.to_owned(), loose: lines });
+                }
             }
             proc_macro2::extra::invalidate_current_thread_spans();
         }
@@ -396,6 +430,9 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
                             test,
                             must,
                             evidence: None,
+                            coverage: None,
+                            gated: false,
+                            bonus: 0.0,
                             group: None,
                             screen: Screen::NotAsked,
                             judge: Judge::NotAsked,
@@ -447,8 +484,26 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
     }
     drop(sources);
 
+    // Layer 5b: coverage map (gate / must / boost).
+    if let Some(map) = &cov_map {
+        coverage::apply(&mut out.coverage, map, &out.ws, &out.files, &out.items, &loose, &out.escalations, &mut candidates);
+    }
+    drop(cov_map);
+    let cov_boost = out.coverage.used == CoveragePolicy::Boost;
+    for c in &mut candidates {
+        c.bonus = if c.must.is_some() {
+            0.0
+        } else if cov_boost && c.coverage.as_ref().is_some_and(|f| !f.is_empty()) {
+            COVER_BOOST
+        } else if c.evidence.as_ref().is_some_and(|(k, _)| is_static(*k)) {
+            BOOST
+        } else {
+            0.0
+        };
+    }
+
     // Layers 6 and 7: Jev.
-    let open: Vec<usize> = (0..candidates.len()).filter(|&i| candidates[i].must.is_none()).collect();
+    let open: Vec<usize> = (0..candidates.len()).filter(|&i| candidates[i].must.is_none() && !candidates[i].gated).collect();
     let mut groups: Vec<Group> = Vec::new();
     {
         let mut group_of: HashMap<(&str, &str), usize> = HashMap::new();
@@ -517,6 +572,10 @@ pub fn run(root: &Path, cfg: &Config, scope: crate::changes::Scope, sw: &Switche
         if let Some(m) = c.must {
             c.reasons.push(m.as_str());
             c.selected = true;
+            continue;
+        }
+        if c.gated {
+            c.reasons.push("not-covered");
             continue;
         }
         if jev_off {
@@ -618,8 +677,8 @@ fn record_items(
             continue;
         }
         symbols.push(format!("{pname}: {}{tag}", item.path));
-        if !item.container_or_test {
-            items.push(ChangedItem { path: item_path.to_owned(), name: item.name, owner: item.owner });
+        if !matches!(item.kind, scan::Kind::Test | scan::Kind::Mod) {
+            items.push(ChangedItem { path: item_path.to_owned(), name: item.name, owner: item.owner, kind: item.kind });
         }
     }
 }
@@ -650,7 +709,7 @@ fn judge_all(
     let mut asked: Vec<usize> = Vec::new();
     let mut questions: Vec<Value> = Vec::new();
     for (g, group) in groups.iter().enumerate() {
-        let screen = if group.members.iter().any(|&i| candidates[i].evidence.is_some()) {
+        let screen = if group.members.iter().any(|&i| candidates[i].bonus > 0.0) {
             Screen::KeptEvidence
         } else if group.members.len() == 1 {
             Screen::Single

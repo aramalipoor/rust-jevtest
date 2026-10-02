@@ -3,6 +3,7 @@
 
 mod changes;
 mod config;
+mod coverage;
 mod evidence;
 mod git;
 mod jev;
@@ -20,8 +21,8 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use config::{ChangeMode, Config, Runner, WithoutJev};
 
-/// Run only the Rust tests your change can break: crate reach, static evidence and TypeSafe Jev
-/// judgments, as a cargo-nextest (or cargo test) command.
+/// Run only the Rust tests your change can break: crate reach, static evidence, a per-test
+/// coverage map and TypeSafe Jev judgments, as a cargo-nextest (or cargo test) command.
 #[derive(Parser)]
 #[command(name = "cargo-jevtest", bin_name = "cargo jevtest", version)]
 struct Cli {
@@ -56,12 +57,33 @@ enum Cmd {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Build or inspect the per-test coverage map.
+    Coverage {
+        #[command(subcommand)]
+        action: CoverageAction,
+    },
 }
 
 #[derive(Subcommand)]
 enum CacheAction {
     /// Delete every cached Jev answer.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum CoverageAction {
+    /// Run every test (one process each) under an instrumented build and write the map of which
+    /// workspace functions each test executes. Needs cargo-nextest and LLVM tools matching rustc.
+    Build {
+        /// Where to write the map (default: config `coverage.map`, `.jevtest/coverage.json.gz`).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Extra `cargo nextest run` arguments (filters, features, `--run-ignored all`).
+        #[arg(last = true, value_name = "NEXTEST_ARGS")]
+        args: Vec<String>,
+    },
+    /// Show the map: path, commit, age, tests, functions, size; warns when stale.
+    Info,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -183,6 +205,10 @@ const AGENTS_BLOCK: &str = "<!-- jevtest -->
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
+    // The hidden target runner `coverage build` installs: `cargo-jevtest __cov-runner <bin> <args…>`.
+    if args.get(1).is_some_and(|a| a == coverage::RUNNER) {
+        return coverage::runner(&args[2..]);
+    }
     if args.get(1).is_some_and(|a| a == "jevtest") {
         args.remove(1);
     }
@@ -294,6 +320,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Some(Cmd::Init { force }) => return init(*force),
         Some(Cmd::Doctor) => return doctor(g),
         Some(Cmd::Cache { action: CacheAction::Clear }) => return cache_clear(g),
+        Some(Cmd::Coverage { action }) => {
+            let root = git::repo_root(Path::new("."))?;
+            let cfg = config::load(&root, g.config.as_deref(), profile(g).as_deref())?;
+            match action {
+                CoverageAction::Build { out, args } => coverage::build(&root, &cfg.coverage, out.as_deref(), args)?,
+                CoverageAction::Info => coverage::info(&root, &cfg.coverage)?,
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         _ => {}
     }
 

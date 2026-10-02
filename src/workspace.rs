@@ -1,7 +1,7 @@
 //! Workspace packages from `cargo metadata` and the reverse-dependency graph.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -10,10 +10,16 @@ pub struct Package {
     pub name: String,
     /// Repo-relative manifest dir; `""` for a package at the repo root.
     pub dir: String,
+    /// A proc-macro crate: its code runs inside rustc, where no test coverage sees it.
+    pub proc_macro: bool,
+    /// Names of its binary targets.
+    pub bins: Vec<String>,
 }
 
 pub struct Workspace {
     pub packages: Vec<Package>,
+    /// Cargo's target directory.
+    pub target_dir: PathBuf,
     /// Package index → indices of packages that directly depend on it.
     rdeps: Vec<Vec<usize>>,
 }
@@ -22,6 +28,7 @@ pub struct Workspace {
 struct Metadata {
     packages: Vec<MetaPackage>,
     workspace_members: Vec<String>,
+    target_directory: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +37,13 @@ struct MetaPackage {
     name: String,
     manifest_path: String,
     dependencies: Vec<MetaDep>,
+    targets: Vec<MetaTarget>,
+}
+
+#[derive(Deserialize)]
+struct MetaTarget {
+    name: String,
+    kind: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -63,7 +77,12 @@ impl Workspace {
                 format!("package {} at {} is outside the repo {}", p.name, dir.display(), root.display())
             })?;
             let rel = rel.to_str().ok_or_else(|| format!("non-UTF-8 path for package {}", p.name))?;
-            packages.push(Package { name: p.name.clone(), dir: rel.to_owned() });
+            packages.push(Package {
+                name: p.name.clone(),
+                dir: rel.to_owned(),
+                proc_macro: p.targets.iter().any(|t| t.kind.iter().any(|k| k == "proc-macro")),
+                bins: p.targets.iter().filter(|t| t.kind.iter().any(|k| k == "bin")).map(|t| t.name.clone()).collect(),
+            });
         }
         let index: HashMap<&str, usize> = metas.iter().enumerate().map(|(i, p)| (p.name.as_str(), i)).collect();
         let mut rdeps = vec![Vec::new(); packages.len()];
@@ -81,7 +100,7 @@ impl Workspace {
                 rdeps[j].push(i);
             }
         }
-        Ok(Workspace { packages, rdeps })
+        Ok(Workspace { packages, target_dir: meta.target_directory, rdeps })
     }
 
     /// The package whose manifest dir is the longest prefix of `file` (repo-relative).

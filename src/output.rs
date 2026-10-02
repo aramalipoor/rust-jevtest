@@ -4,9 +4,59 @@ use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 
-use crate::config::{Config, OnJevError, Runner, WithoutJev};
+use crate::config::{Config, CoveragePolicy, OnJevError, Runner, WithoutJev};
 use crate::jev::Usage;
-use crate::select::{Candidate, JevState, Judge, Must, Screen, Selection, VIEWS, evidence_kind};
+use crate::select::{BOOST, Candidate, JevState, Judge, Must, Screen, Selection, VIEWS, evidence_kind, is_static};
+
+/// Whether the coverage map says `c` executes a changed function.
+fn covers(c: &Candidate) -> bool {
+    c.coverage.as_ref().is_some_and(|f| !f.is_empty())
+}
+
+/// The summary's one `coverage:` line.
+fn coverage_line(s: &Selection) -> String {
+    let cv = &s.coverage;
+    let Some(map) = &cv.map else {
+        return format!("coverage: {}", cv.reason.as_deref().unwrap_or("off"));
+    };
+    let commit = cv.commit.as_deref().map_or("", |c| &c[..c.len().min(12)]);
+    let age = cv.age_commits.map_or_else(|| "not in HEAD's history".to_owned(), |n| format!("{} behind the base", crate::coverage::n_commits(n)));
+    let mut line = format!("coverage: {map} @{commit} ({age}), policy {}: {} covered", cv.used.as_str(), cv.covered);
+    let _ = match cv.used {
+        CoveragePolicy::Gate => write!(line, ", {} gated out (not-covered)", cv.gated_out),
+        CoveragePolicy::Must => write!(line, ", {} must (covered)", count(s, |c| c.must == Some(Must::Covered))),
+        CoveragePolicy::Boost => write!(line, ", {} boosted +{}", count(s, |c| c.must.is_none() && covers(c)), crate::coverage::COVER_BOOST),
+        CoveragePolicy::Off => Ok(()),
+    };
+    let _ = write!(line, ", {} unknown to the map", cv.unknown);
+    if let Some(b) = cv.blind.first() {
+        let more = if cv.blind.len() > 1 { format!(" (+{} more)", cv.blind.len() - 1) } else { String::new() };
+        let _ = write!(line, "; blind: {} — {}{more}", b.item, b.why);
+    }
+    if let Some(r) = &cv.reason {
+        let _ = write!(line, "; {r}");
+    }
+    line
+}
+
+/// The report's top-level `coverage` object.
+fn coverage_json(s: &Selection) -> Value {
+    let cv = &s.coverage;
+    let name = |p: usize| s.ws.packages[p].name.as_str();
+    json!({
+        "map": cv.map,
+        "commit": cv.commit,
+        "age_commits": cv.age_commits,
+        "policy_requested": cv.requested.as_str(),
+        "policy_used": cv.used.as_str(),
+        "covered": cv.covered,
+        "gated_out": cv.gated_out,
+        "unknown": cv.unknown,
+        "blind_items": cv.blind.iter().map(|b| json!({"package": name(b.package), "item": b.item, "why": b.why})).collect::<Vec<_>>(),
+        "no_gate_packages": cv.no_gate.iter().map(|&p| name(p)).collect::<Vec<_>>(),
+        "reason": cv.reason,
+    })
+}
 
 /// What to run.
 pub struct Plan {
@@ -293,17 +343,18 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
         let _ = writeln!(
             o,
             "static: must {} (changed {}, package {}, direct {}, helper {}); evidence on {} (direct {}, helper {}, transitive {}), boosted {}",
-            count(s, |c| c.must.is_some()),
+            count(s, |c| c.must.is_some_and(|m| m != Must::Covered)),
             must(Must::Changed),
             must(Must::Package),
             must(Must::Direct),
             must(Must::Helper),
-            count(s, |c| c.evidence.is_some()),
+            count(s, |c| c.evidence.as_ref().is_some_and(|(k, _)| is_static(*k))),
             count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Direct, _)))),
             count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Helper, _)))),
             count(s, |c| matches!(&c.evidence, Some((crate::evidence::EvidenceKind::Transitive(_), _)))),
-            count(s, |c| c.boost() > 0.0),
+            count(s, |c| c.bonus > 0.0 && c.evidence.as_ref().is_some_and(|(k, _)| is_static(*k))),
         );
+        let _ = writeln!(o, "{}", coverage_line(s));
         match &s.jev {
             JevState::Off(_) => {
                 if let Some(n) = jev_notice(s, cfg) {
@@ -433,6 +484,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
                 "reach_depth": c.depth,
                 "must": c.must.map(Must::as_str),
                 "evidence": c.evidence.as_ref().map(|(k, syms)| json!({"kind": evidence_kind(*k), "symbols": syms})),
+                "coverage": json!({"known": c.coverage.is_some(), "covered": c.coverage.as_deref().unwrap_or_default()}),
                 "screen": format!("{:?}", c.screen).to_lowercase(),
                 "group_noul": c.group.and_then(|g| s.groups[g].noul),
                 "nouls": per_view(&c.nouls),
@@ -506,12 +558,46 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
             "total": usage_json("total", &total),
         },
         "filtersets": {"rules": s.rule_runs, "always": cfg.tests.always, "never": cfg.tests.never},
+        "coverage": coverage_json(s),
         "filter": plan.filter,
         "commands": plan.commands,
         "command": plan.commands.iter().map(|c| command_line(c)).collect::<Vec<_>>().join("\n"),
         "notes": plan.notes,
         "wall_ms": s.wall_ms as u64,
     })
+}
+
+/// `explain`'s coverage verdict for one candidate.
+fn coverage_verdict(s: &Selection, c: &Candidate) -> String {
+    let cv = &s.coverage;
+    if cv.map.is_none() {
+        return format!("layer skipped: {}", cv.reason.as_deref().unwrap_or("off"));
+    }
+    let Some(fns) = &c.coverage else {
+        return "not in the map (new, renamed, or not run when it was built) → never gated".to_owned();
+    };
+    if !fns.is_empty() {
+        let effect = match (cv.used, c.must) {
+            (CoveragePolicy::Must, Some(Must::Covered)) => "→ must".to_owned(),
+            (_, Some(m)) => format!("(already must: {})", m.as_str()),
+            (CoveragePolicy::Boost, None) => format!("→ boost +{}, skips screening", crate::coverage::COVER_BOOST),
+            _ => "→ not gated".to_owned(),
+        };
+        return format!("executes changed {} {effect}", fns.join(", "));
+    }
+    if c.gated {
+        return "executes none of the changed functions → gated out (not-covered)".to_owned();
+    }
+    let why = if let Some(m) = c.must {
+        format!("must: {}", m.as_str())
+    } else if c.evidence.is_some() {
+        "has static evidence".to_owned()
+    } else if cv.no_gate.contains(&c.pkg) {
+        "its package is exempt: coverage-blind changes (see blind_items)".to_owned()
+    } else {
+        format!("policy {}", cv.used.as_str())
+    };
+    format!("executes none of the changed functions; not gated ({why})")
 }
 
 /// `explain PATTERN`: every layer's verdict for each matching candidate.
@@ -545,20 +631,22 @@ pub fn explain(s: &Selection, cfg: &Config, pattern: &str) -> String {
         let _ = writeln!(o, "  discovery:  lines {}-{}, module `{}`", c.test.start, c.test.end, c.test.module);
         let ev = match (&c.must, &c.evidence) {
             (Some(Must::Changed), _) => "its own lines changed → must".to_owned(),
-            (_, Some((k, syms))) => format!(
+            (_, Some((k, syms))) if is_static(*k) => format!(
                 "{} via {}{}",
                 evidence_kind(*k),
                 syms.join(", "),
-                if c.must.is_some() { " → must" } else { " → boost +0.2, skips screening" }
+                if c.must.is_some() { " → must".to_owned() } else { format!(" → boost +{BOOST}, skips screening") }
             ),
-            (Some(Must::Package), None) => "whole package → must".to_owned(),
+            (Some(Must::Package), _) => "whole package → must".to_owned(),
             _ => "none".to_owned(),
         };
         let _ = writeln!(o, "  evidence:   {ev}");
+        let _ = writeln!(o, "  coverage:   {}", coverage_verdict(s, c));
         let screen = match c.screen {
             Screen::NotAsked if c.must.is_some() => "skipped (must)".to_owned(),
+            Screen::NotAsked if c.gated => "skipped (gated out by coverage)".to_owned(),
             Screen::NotAsked => "skipped (Jev off)".to_owned(),
-            Screen::KeptEvidence => "kept without asking (a group member has static evidence)".to_owned(),
+            Screen::KeptEvidence => "kept without asking (a group member has static evidence or a coverage boost)".to_owned(),
             Screen::Single => "skipped (only test in its group; judged directly)".to_owned(),
             Screen::Kept | Screen::Dropped => {
                 let n = c.group.and_then(|g| s.groups[g].noul).unwrap_or(0.0);
@@ -582,7 +670,7 @@ pub fn explain(s: &Selection, cfg: &Config, pattern: &str) -> String {
                     "{}; score {:.3}{}",
                     views.join(", "),
                     c.score.unwrap_or(0.0),
-                    if c.boost() > 0.0 { " (incl. +0.2 boost)" } else { "" }
+                    if c.boost() > 0.0 { format!(" (incl. +{} boost)", c.boost()) } else { String::new() }
                 )
             }
             Judge::NotAsked => "not asked".to_owned(),

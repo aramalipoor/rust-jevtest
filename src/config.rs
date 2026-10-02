@@ -30,6 +30,7 @@ pub struct Config {
     pub rules: Vec<Rule>,
     pub tests: Tests,
     pub jev: Jev,
+    pub coverage: Coverage,
     /// The file the settings came from; `None` = built-in defaults.
     pub source: Option<PathBuf>,
 }
@@ -299,6 +300,56 @@ impl Jev {
     }
 }
 
+/// The per-test coverage map (`[coverage]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Coverage {
+    /// Relative paths are from the repo root; `~` is expanded by [`load`].
+    pub map: PathBuf,
+    pub policy: CoveragePolicy,
+    pub max_age_commits: usize,
+    /// Directory holding `llvm-profdata` and `llvm-cov`; empty = search. `~` is expanded by [`load`].
+    pub llvm_bin: PathBuf,
+    /// Parallel mapping jobs in `coverage build`; 0 = one per core.
+    pub jobs: usize,
+}
+
+impl Default for Coverage {
+    fn default() -> Self {
+        Self {
+            map: ".jevtest/coverage.json.gz".into(),
+            policy: CoveragePolicy::Gate,
+            max_age_commits: 200,
+            llvm_bin: PathBuf::new(),
+            jobs: 0,
+        }
+    }
+}
+
+/// How tests the coverage map knows are treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoveragePolicy {
+    /// Drop tests that execute no changed function (and have no other evidence) before Jev.
+    Gate,
+    /// Tests that execute a changed function always run.
+    Must,
+    /// Tests that execute a changed function skip screening and score +0.3.
+    Boost,
+    Off,
+}
+
+impl CoveragePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoveragePolicy::Gate => "gate",
+            CoveragePolicy::Must => "must",
+            CoveragePolicy::Boost => "boost",
+            CoveragePolicy::Off => "off",
+        }
+    }
+}
+
 /// On-disk shape of `jevtest.toml`.
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -310,12 +361,14 @@ struct File {
     changes: Changes,
     tests: Tests,
     jev: Jev,
+    coverage: Coverage,
     profile: BTreeMap<String, toml::Table>,
 }
 
 /// Loads the config: `explicit` if given (must exist), else `jevtest.toml` at `repo_root`, else
 /// `.config/jevtest.toml`, else built-in defaults; then overlays `[profile.<profile>]`, validates
-/// and expands `~` in `key_file`/`cache_dir`. Errors name the file and the offending key.
+/// and expands `~` in `key_file`/`cache_dir`/`coverage.map`/`coverage.llvm_bin`. Errors name the
+/// file and the offending key.
 pub fn load(repo_root: &Path, explicit: Option<&Path>, profile: Option<&str>) -> Result<Config, String> {
     let source = match explicit {
         Some(path) if path.is_file() => Some(path.to_path_buf()),
@@ -353,11 +406,14 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>, profile: Option<&str>) ->
         rules: file.rules,
         tests: file.tests,
         jev: file.jev,
+        coverage: file.coverage,
         source,
     };
     config.validate().map_err(|e| format!("{origin}: {e}"))?;
     expand_home(&mut config.jev.key_file);
     expand_home(&mut config.jev.cache_dir);
+    expand_home(&mut config.coverage.map);
+    expand_home(&mut config.coverage.llvm_bin);
     Ok(config)
 }
 
@@ -415,17 +471,21 @@ impl Config {
             }
             check_globs(&format!("{at} when"), &rule.when)?;
         }
+        if self.coverage.map.as_os_str().is_empty() {
+            return Err("coverage.map is empty".into());
+        }
         Ok(())
     }
 }
 
 /// Overlays a `[profile.X]` table: each key replaces the same-named key of `[select]`,
-/// `[changes]`, `[tests]` or `[jev]` (key sets are disjoint).
+/// `[changes]`, `[tests]`, `[jev]` or `[coverage]` (key sets are disjoint).
 fn apply_profile(file: &mut File, overlay: toml::Table) -> Result<(), String> {
     let mut select = toml::Table::try_from(&file.select).map_err(|e| e.to_string())?;
     let mut changes = toml::Table::try_from(&file.changes).map_err(|e| e.to_string())?;
     let mut tests = toml::Table::try_from(&file.tests).map_err(|e| e.to_string())?;
     let mut jev = toml::Table::try_from(&file.jev).map_err(|e| e.to_string())?;
+    let mut coverage = toml::Table::try_from(&file.coverage).map_err(|e| e.to_string())?;
     for (key, value) in overlay {
         let section = if select.contains_key(&key) {
             &mut select
@@ -435,8 +495,10 @@ fn apply_profile(file: &mut File, overlay: toml::Table) -> Result<(), String> {
             &mut tests
         } else if jev.contains_key(&key) {
             &mut jev
+        } else if coverage.contains_key(&key) {
+            &mut coverage
         } else {
-            return Err(format!("unknown key `{key}` (profiles take [select], [changes], [tests] and [jev] keys)"));
+            return Err(format!("unknown key `{key}` (profiles take [select], [changes], [tests], [jev] and [coverage] keys)"));
         };
         section.insert(key, value);
     }
@@ -445,6 +507,7 @@ fn apply_profile(file: &mut File, overlay: toml::Table) -> Result<(), String> {
     file.changes = changes.try_into().map_err(fix)?;
     file.tests = tests.try_into().map_err(fix)?;
     file.jev = jev.try_into().map_err(fix)?;
+    file.coverage = coverage.try_into().map_err(fix)?;
     Ok(())
 }
 
@@ -550,6 +613,18 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # timeout_secs = 30                                     # per-request timeout, in seconds
 # cache_dir = "~/.cache/jevtest"                        # verdict cache; `cargo jevtest cache clear` empties it
 
+[coverage]
+# Per-test coverage map from `cargo jevtest coverage build` (build it nightly on the default branch).
+# map = ".jevtest/coverage.json.gz"   # gzip JSON; relative paths are from the repo root
+# policy = "gate"             # gate | must | boost | off: what a test that executes a changed function gets
+#                             # gate: tests the map knows that execute no changed function (and have no static
+#                             #   evidence) are dropped before Jev; never when a changed item is coverage-blind
+#                             # must: tests that execute a changed function always run
+#                             # boost: they skip screening and score +0.3
+# max_age_commits = 200       # an older map (or one not in HEAD's history) downgrades to boost
+# llvm_bin = ""               # dir with llvm-profdata + llvm-cov matching rustc's LLVM; empty = search
+# jobs = 0                    # parallel mapping jobs in `coverage build` (0 = one per core)
+
 # Path-triggered must-runs: when any `when` glob matches a changed file, run the `run` filtersets,
 # the whole `packages`, or everything (`full = true`). Repeat the block for more rules.
 # [[rule]]
@@ -558,7 +633,8 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # packages = []                                # packages to run whole
 # full = false                                 # true = run the full suite
 
-# Profiles override any [select], [tests] or [jev] key; pick one with --profile ci or JEVTEST_PROFILE=ci.
+# Profiles override any [select], [changes], [tests], [jev] or [coverage] key; pick one with
+# --profile ci or JEVTEST_PROFILE=ci.
 # [profile.ci]
 # top_n = 60
 # on_jev_error = "full"

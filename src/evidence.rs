@@ -32,6 +32,8 @@ pub struct ChangedItem {
     pub name: String,
     /// The impl (or trait) type, e.g. `Schedule`.
     pub owner: Option<String>,
+    /// What the item is; the coverage layer gates only on executable bodies.
+    pub kind: crate::scan::Kind,
 }
 
 #[derive(Clone, Debug)]
@@ -44,11 +46,14 @@ pub struct TestRef {
 }
 
 /// Ordered strongest first: `Direct` > `Helper` > `Transitive(1)` > `Transitive(2)` ...
+/// `Covered(n)` comes from the coverage map, not from this module: the test executed `n` changed
+/// functions when the map was built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceKind {
     Direct,
     Helper,
     Transitive(u8),
+    Covered(u32),
 }
 
 #[derive(Clone, Debug)]

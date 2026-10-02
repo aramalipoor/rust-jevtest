@@ -167,12 +167,78 @@ Each layer records its verdict per candidate; `explain` and the JSON report show
 | 3 | Reach | Changed packages + reverse deps (normal, dev, build) | `cargo metadata` | `select.reach_depth` |
 | 4 | Discovery | Tests in reached packages, via `syn`, with spans and source | parse | none |
 | 5 | Static evidence | `Changed` (test's own span changed) → must. `Direct` (test names a changed item) and `Helper` (a same-module non-test fn it calls does) → must or boost. `Transitive` (reaches a changed item through the name-based call graph) → boost. Boost = skips screening, +0.2 score (cap 1.0) | parse, no model | `select.static_evidence`, `select.call_graph_depth` |
+| 5b | Coverage | With a [coverage map](#coverage-map): `gate` drops tests that execute no changed function and have no other evidence, unless a change is coverage-blind; `must` runs covered tests; `boost` makes them skip screening with +0.3 | free (map built nightly) | `[coverage]` |
 | 6 | Screening (Jev stage 1) | One Noul per (package, file, module) group of non-must candidates; groups below `group_threshold` dropped unless a member has evidence | Jev, small | `select.group_threshold`, `jev.max_group_chars` |
 | 7 | Judging (Jev stage 2) | One Noul per surviving test per view: `names` (package, module, name; ~50 tokens) and `body` (test source). Score = max over views + boost; ranks per view | Jev, most tokens | `jev.views`, `jev.max_test_chars`, `jev.batch`, `jev.concurrency`, `jev.max_questions`, `jev.max_state_chars` |
 | 8 | Policy | selected = must ∪ rules ∪ `tests.always` ∪ top picks per view (`min(top_n, ⌈top_fraction × tests that view ranked⌉)`) ∪ {score ≥ `threshold`} ∪ unjudged; minus `tests.never` unless the test changed; then `max_tests` / `min_tests` by score. Without Jev (no key, `--no-jev`): `without_jev = "reach"` selects every reached test; `"evidence"` selects must ∪ static evidence ∪ rules ∪ `tests.always` | free | `select.top_n`, `select.top_fraction`, `select.threshold`, `select.max_tests`, `select.min_tests`, `select.without_jev`, `tests.always`, `tests.never` |
 | 9 | Output | nextest: `cargo nextest run -p P... -E '<expr>'`. cargo: one `cargo test -p P -- name...` per package. `auto`: nextest if installed, else cargo (one stderr notice) | free | `select.runner`; `--format`, `--json` |
 
 If Jev fails (401/402/403/5xx, timeout, connection error, malformed reply), `select.on_jev_error` decides: `reach` (default: select every reached test, exit 0, one stderr line `jevtest: Jev failed: <cause>; selecting every reached test (on_jev_error = reach)`), `full`, or `fail`. Jev never blocks longer than `jev.timeout_secs` in total.
+
+## Coverage map
+
+A per-test coverage map is the strongest static signal: a test that never executes a changed
+function cannot change outcome because of that function's body. It costs nothing per run; build it
+once (nightly on the default branch) and every selection reads it.
+
+```sh
+cargo jevtest coverage build                # all tests; writes .jevtest/coverage.json.gz
+cargo jevtest coverage build --out /tmp/cov.json.gz -- -p core --run-ignored all   # extra nextest args after --
+cargo jevtest coverage info                 # path, commit, age (commits, days), tests, functions, size
+```
+
+`coverage build` needs cargo-nextest and LLVM tools whose major version matches `rustc -vV`'s `LLVM
+version` (`rustup component add llvm-tools`, or `coverage.llvm_bin`). It builds with `-C
+instrument-coverage` in its own target dir (`target/jevtest-cov`), runs every test in its own process
+(`--no-fail-fast`; failing tests are mapped too) with jevtest as the target runner, which gives each
+test its own `LLVM_PROFILE_FILE`. It then merges each test's profiles (`llvm-profdata merge
+-sparse`), keeps the functions with a non-zero entry count that live in workspace source files, and
+names them as jevtest names changed items (`Type::method`, `name`; closures and generic instances fold
+into the enclosing item) via one `llvm-cov export` per binary. Tests spawning the workspace's own
+binaries are covered too. The map is gzip JSON: `version`, `commit`, `built_at`, `rustc`,
+`functions [{file, name, start, end}]`, `tests [{package, binary_id, name, functions}]`.
+
+Policies (`coverage.policy`), applied after static evidence and before Jev:
+
+| Policy | Tests that execute a changed function | Tests the map knows that execute none |
+|---|---|---|
+| `gate` (default) | go on to screening and judging (evidence `covered(n)`) | dropped (`not-covered`) unless they have static evidence or must run |
+| `must` | always run (`covered`) | unchanged |
+| `boost` | skip screening, +0.3 score | unchanged |
+| `off` | layer skipped | |
+
+The gate steps aside, per package, when a change is coverage-blind: a changed item that is not a
+fn or method (struct, enum, const, static, type alias, trait, `macro_rules`, associated const or
+type, an impl header whose methods are not all in the map), a `const fn`, a changed fn the map does
+not know (new, or no test ran it), a top-level line other than a private `use` (`pub use`, `mod`,
+attributes, item macros), a private `use` in a file the map has never seen, anything in a proc-macro
+crate, and every whole-package escalation (manifest, build script, non-Rust file, parse failure).
+Packages with such changes, and every package that depends on them, are not gated; `blind_items`
+in the report says why. A changed private `use` counts as changing every mapped function of its
+module's files. Tests the map does not know (new, renamed, or not run when it was built) are never
+gated. Changed items match map functions by file and name, not line, so line drift is harmless;
+renamed files match through the diff's old path.
+
+Staleness: a map more than `max_age_commits` commits behind the change base, or built on a commit
+not in `HEAD`'s history, downgrades `gate`/`must` to `boost` (one summary line). No map: the layer is
+skipped with `coverage: no map (cargo jevtest coverage build)`.
+
+Nightly CI recipe (GitHub Actions shape; any CI works):
+
+```yaml
+- run: rustup component add llvm-tools && cargo install cargo-nextest jevtest --locked
+- run: cargo jevtest coverage build          # on the default branch, nightly
+- uses: actions/upload-artifact@v4
+  with: { name: jevtest-coverage, path: .jevtest/coverage.json.gz }
+```
+
+PR lanes download the artifact to `.jevtest/coverage.json.gz` (or point `coverage.map` at it) before
+`cargo jevtest run`. Locally, `cargo jevtest coverage build` on the default branch works the same.
+
+Limits: coverage is from one run, so code reached only under other inputs, timing, features or
+environment is not in it; ignored tests are mapped only with `-- --run-ignored all`; tests that abort
+before exiting write no profile and stay unknown (never gated); doc tests are not mapped.
+Add `.jevtest/` to `.gitignore` unless you want to commit the map.
 
 ## Configuration reference
 
@@ -273,9 +339,21 @@ Which changes feed selection. See [Choosing what changed](#choosing-what-changed
 | `include_untracked` | `true` | Untracked files count as added | |
 | `files` | `[]` | Restrict the diff to these paths/globs, like `--files` | `--files PATH_OR_GLOB` |
 
+### `[coverage]`
+
+See [Coverage map](#coverage-map).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `map` | `".jevtest/coverage.json.gz"` | Map path (repo-relative or absolute); `coverage build` writes it, selection reads it |
+| `policy` | `"gate"` | `gate` \| `must` \| `boost` \| `off`: what tests that execute a changed function get, and whether the rest are dropped |
+| `max_age_commits` | `200` | A map further behind the change base, or built on a commit not in `HEAD`'s history, downgrades `gate`/`must` to `boost` |
+| `llvm_bin` | `""` | Directory with `llvm-profdata` and `llvm-cov`; empty = rustc sysroot (`llvm-tools`), `PATH`, Homebrew `llvm` |
+| `jobs` | `0` | Parallel mapping jobs in `coverage build`; `0` = one per core |
+
 ### Profiles
 
-`[profile.NAME]` takes any `[select]`, `[changes]`, `[jev]` or `[tests]` key, flat. Choose it with `--profile NAME`
+`[profile.NAME]` takes any `[select]`, `[changes]`, `[jev]`, `[tests]` or `[coverage]` key, flat. Choose it with `--profile NAME`
 or `JEVTEST_PROFILE=NAME`.
 
 ```toml
@@ -315,13 +393,17 @@ items, per-stage Jev usage (asked, requests, splits, cache hits, input/output to
 |---|---|
 | `package`, `file`, `line`, `module`, `name` | Test identity |
 | `reach_depth` | Reverse-dependency hops from a changed package |
-| `evidence` `{kind, symbols}` | Static evidence and the changed names it matched |
+| `evidence` `{kind, symbols}` | Static evidence and the changed names it matched; `covered(n)` = no static evidence, but the coverage map says the test executes `n` changed functions |
 | `group_noul` | Stage-1 score of the test's group |
 | `nouls` `{names, body}` | Stage-2 score per view |
 | `score` | Max over views + boost |
 | `ranks` `{names, body}` | Rank per view |
-| `reasons` | Why it was selected or dropped |
+| `coverage` `{known, covered}` | Whether the coverage map knows the test, and the changed functions it executes |
+| `reasons` | Why it was selected or dropped (`not-covered` = dropped by the coverage gate, `covered` = must under `policy = "must"`) |
 | `selected` | Final verdict |
+
+Top-level `coverage`: `map`, `commit`, `age_commits`, `policy_requested`, `policy_used`, `covered`,
+`gated_out`, `unknown`, `blind_items` (`{package, item, why}`), `no_gate_packages`, `reason`.
 
 Exit codes:
 
@@ -368,6 +450,8 @@ cargo jevtest run --profile ci --branch origin/main --json jevtest-report.json
 | Config error naming an unknown key (exit 1) | Typo in `jevtest.toml` or a key in the wrong table | Fix the named key |
 | Default branch cannot be resolved | No `origin/HEAD`, `origin/main`, `origin/master`, `main` or `master` | Set `changes.default_branch`, or pass `--branch BASE` / `--base REV` |
 | Wrong change scope in the `jevtest: changes = …` line | `auto` guessed differently from what you meant | Pass a scope flag (`--uncommitted`, `--branch`, `--last N`, …); see [Choosing what changed](#choosing-what-changed) |
+| `coverage:` line says `no gating in [...]` | The diff touches something coverage cannot see (see `blind_items` in `--format json`) | Nothing: those packages are selected as without a map |
+| `coverage build` fails on llvm tools | No `llvm-profdata`/`llvm-cov` matching rustc's LLVM major | `rustup component add llvm-tools`, or set `coverage.llvm_bin` |
 
 ## Limits
 
