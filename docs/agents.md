@@ -94,7 +94,7 @@ Pass one scope flag to choose exactly. Scope flags are mutually exclusive; `--fi
 | `--commit REV` | exactly this commit: `REV^..REV` |
 | `--since WHEN` | commits since WHEN (`today`, `midnight`, `6 hours ago`, `2026-10-01`; git date syntax) on first-parent history: base = parent of the oldest such commit, head = `HEAD` |
 | `--range A..B` / `--base A [--head B]` | explicit range; `A..` or no `--head` = against the working tree |
-| `--files PATH_OR_GLOB...` (repeatable) | restrict the scope's diff to these paths, directories or globs. A listed file (not a directory, not a glob) with no diff in scope counts as wholly changed, so `--files src/x.rs` alone means "the impact of this file"; directories and globs only narrow |
+| `--files PATH_OR_GLOB...` (repeatable) | restrict the scope's diff to these paths, directories or globs. A listed file (not a directory, not a glob; binary files too) with no diff in scope counts as wholly changed, so `--files src/x.rs` alone means "the impact of this file"; directories and globs only narrow. The `jevtest: changes` line then counts the kept files (`1 file of 24 (--files)`) |
 
 `--changes auto|uncommitted|staged|unstaged|branch|last|since|range` is the long form of the same choice (matches `changes.mode`).
 
@@ -163,8 +163,8 @@ Each layer records its verdict per candidate; `explain` and the JSON report show
 | # | Layer | What it does | Cost | Config keys |
 |---|---|---|---|---|
 | 1 | Intake | Diff for the chosen change scope (see [Choosing what changed](#choosing-what-changed)); changed lines on both sides; changed items from old and new source (fn, `Type::method`, struct, enum, trait, const, static, type alias, `macro_rules`, deleted items too) | git + parse | `[changes]`; scope flags |
-| 2 | Path policy | `full_run` paths → full run; `ignore` paths dropped; `[[rule]]` matches → must filtersets, whole packages or full run; root `Cargo.toml`/`Cargo.lock` and member manifests → [manifest semantics](#manifests-and-the-lockfile); files under a path dependency → its dependent members changed; files outside every package → `paths.outside`; non-Rust file in a package → `non_rust` policy; unparsable `.rs` → whole package | free (`cargo metadata` with dependencies only for a path dependency without a lockfile) | `paths.full_run`, `paths.ignore`, `paths.outside`, `[[rule]]`, `select.non_rust` |
-| 3 | Reach | Changed packages + reverse deps (normal, dev, build) | `cargo metadata` | `select.reach_depth` |
+| 2 | Path policy | `full_run` paths → full run; `[[rule]]` matches → must filtersets, whole packages (reaching their reverse deps) or full run, on top of the handling below unless the rule is `exclusive`; `ignore` paths dropped; root `Cargo.toml`/`Cargo.lock` and member manifests → [manifest semantics](#manifests-and-the-lockfile); files under a path dependency → its dependent members changed; files outside every package → `paths.outside`; non-Rust file in a package → `non_rust` policy; unparsable `.rs` → whole package | free (`cargo metadata` with dependencies only for a path dependency without a lockfile) | `paths.full_run`, `paths.ignore`, `paths.outside`, `[[rule]]`, `select.non_rust` |
+| 3 | Reach | Changed packages and packages a `[[rule]]` names (unless `reach = false`) + reverse deps (normal, dev, build). The summary groups them by hops: `reached 6: 0 hops [core]; 1 hop [api, cli]; 2 hops [app]` | `cargo metadata` | `select.reach_depth` |
 | 4 | Discovery | Tests in reached packages, via `syn`, with spans and source | parse | none |
 | 5 | Static evidence | `Changed` (test's own span changed) → must. `Direct` (test names a changed item) and `Helper` (a same-module non-test fn it calls does) → must or boost. `Transitive` (reaches a changed item through the name-based call graph) → boost. Boost = skips screening, +0.2 score (cap 1.0) | parse, no model | `select.static_evidence`, `select.call_graph_depth` |
 | 5b | Coverage | With a [coverage map](#coverage-map): `gate` drops tests that execute no changed function and have no other evidence, unless a change is coverage-blind; `must` runs covered tests; `boost` makes them skip screening with +0.3 | free (map built nightly) | `[coverage]` |
@@ -269,7 +269,7 @@ names the key.
 |---|---|---|
 | `ignore` | `["**/*.md", "docs/**", ".github/**"]` | Changes here are ignored |
 | `full_run` | `["rust-toolchain", "rust-toolchain.toml", ".cargo/**", ".config/nextest.toml"]` | Changes here escalate to the full suite. The explicit override: list `Cargo.toml` or `Cargo.lock` here to make any change to them a full run again |
-| `outside` | `"referenced"` | A changed file outside every package and every path dependency. `referenced`: the packages whose Rust source (build.rs included; comments do not count) names it in a string literal — a word ending with its path or basename, or with two consecutive components of a parent directory, or a literal that is exactly its top-level directory when it sits directly in one (`include_str!("../../docs/openapi.json")`, `sqlx::migrate!("../../migrations")`) — run whole; files nothing names are ignored, listed on one summary line (`outside_ignored_files` in the report). `full`: any such file runs the full suite. `ignore`: such files never matter |
+| `outside` | `"referenced"` | A changed file outside every package and every path dependency. `referenced`: the packages whose Rust source (build.rs included; comments do not count) names it in a string literal run whole. A literal names a file when a path-like word in it ends with the file's path or last two components, or with two consecutive components of a parent directory; when the whole literal is the top-level directory the file sits directly in (`"migrations"`, `"../../migrations"`); when a word ends with its basename and that basename has an extension, at least 5 characters and is not a common name (`mod.rs`, `lib.rs`, `main.rs`, `README.md`, `AGENTS.md`, `Cargo.toml`, `index.html`); or, for a changed submodule (gitlink), when a word runs through the submodule's last two components into it (`"../../../proto/manifesto/evm"` for `proto/manifesto`). So `include_str!("../../docs/openapi.json")` and `sqlx::migrate!("../../migrations")` count, a literal `"0"` or `"lib.rs"` does not. Each file's literals are cached by blob id under `jev.cache_dir`, so a run reads and tokenizes only files that changed since the last one. Files nothing names are ignored, listed on one summary line (`outside_ignored_files` in the report). `full`: any such file runs the full suite. `ignore`: such files never matter |
 
 #### Manifests and the lockfile
 
@@ -290,13 +290,19 @@ makes the members depending on it changed, the same way, found through `Cargo.lo
 
 ### `[[rule]]` (repeatable)
 
-Path-triggered must-runs. `when` is a list of globs; set any of `run`, `packages`, `full`.
+Path-triggered must-runs. `when` is a list of globs; set any of `run`, `packages`, `full`. A rule
+adds to what jevtest does with the matched file on its own (a non-Rust file's whole-package run, a
+`paths.outside = "referenced"` match, a `.rs` file's changed items); `exclusive = true` makes the
+rule replace that handling, e.g. to narrow a migration's whole-package run to the test binaries
+that apply migrations. `paths.full_run` still wins over every rule.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `when` | none | Globs of changed paths that fire the rule |
 | `run` | `[]` | nextest filtersets that must run |
 | `packages` | `[]` | Packages run whole |
+| `reach` | `true` | `packages` also reach their reverse dependencies, as a changed package does (`select.reach_depth` applies); `false` keeps only the named packages |
+| `exclusive` | `false` | The rule replaces jevtest's own handling of the matched file instead of adding to it |
 | `full` | `false` | Escalate to the full suite |
 
 Example: migrations change behaviour no Rust symbol shows.
@@ -304,11 +310,13 @@ Example: migrations change behaviour no Rust symbol shows.
 ```toml
 [[rule]]
 when = ["crates/core/migrations/**"]
-run = ["package(=core) & test(/store::/)"]
+run = ["package(=core) & binary(=store)"]
+exclusive = true            # only the store binary, not core's whole-package run for a non-Rust file
 
 [[rule]]
 when = ["crates/api/fixtures/**", "crates/api/src/generated/**"]
 packages = ["api"]          # macro-generated or data-driven tests: run the package whole
+reach = false               # its dependents do not read the fixtures
 
 [[rule]]
 when = ["build.rs", "proto/**"]
@@ -338,7 +346,7 @@ full = true
 | `max_test_chars` | `800` | Test source per `body` question |
 | `max_group_chars` | `600` | Group description per screening question |
 | `timeout_secs` | `30` | Jev time budget; Jev never blocks longer than this in total |
-| `cache_dir` | `"~/.cache/jevtest"` | Answer cache. Each answer is keyed on its own by sha256 of the model, the change state (diff, changed packages and items) and the question; the answers to one change state share one append-only `.answers` file. Editing a `[[rule]]` or a threshold re-asks nothing already answered for the same change. Per-request cache files of jevtest 0.3.0 and earlier are ignored (`cache clear` removes them) |
+| `cache_dir` | `"~/.cache/jevtest"` | Answer cache. Each answer is keyed on its own by sha256 of the model, the change state (diff, changed packages and items) and the question; the answers to one change state share one append-only `.answers` file. Editing a `[[rule]]` or a threshold re-asks nothing already answered for the same change. Per-request cache files of jevtest 0.3.0 and earlier are ignored (`cache clear` removes them). Also holds `literals-v1/`, the per-blob string-literal index of `paths.outside = "referenced"` (`cache clear` removes it too) |
 
 ### `[changes]`
 
@@ -402,7 +410,7 @@ Other: `--profile NAME`, `--config PATH`,
 | `json` | the full report | |
 
 `--json PATH` writes the full report to a file with any format. Report fields: `version`, base, head,
-`changes` (`requested`, `used`, `what`, `reason`, `base`, `head`, `files`, `lines`, `narrowed_from`),
+`changes` (`requested`, `used`, `what`, `reason`, `base`, `head`, `files`, `ignored_files`, `files_before_narrowing`, `lines`, `narrowed_from`),
 profile, config path, changed files, ignored files, `outside_ignored_files`, escalations (`kind`:
 `full`, `whole`, `changed`, `ignored`), rules fired, changed, reached, whole and `dependency_packages`,
 changed items, `picks` (`top_n`, `threshold`, `only_top_n`, `only_threshold`), `filtersets_run`,

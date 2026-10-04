@@ -1,6 +1,6 @@
 //! Git plumbing: running git, parsing the `-U0` diff, reading files at a revision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -118,6 +118,8 @@ pub struct FileChange {
     pub status: Status,
     pub new_ranges: Vec<Range>,
     pub old_ranges: Vec<Range>,
+    /// A submodule (mode 160000) on either side: the path names a directory of another repo.
+    pub gitlink: bool,
 }
 
 impl FileChange {
@@ -181,7 +183,9 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
         // `:<old mode> <new mode> <old sha> <new sha> <status>\t<path>[\t<new path>]`
         let Some(raw) = line.strip_prefix(':') else { continue };
         let mut fields = raw.split('\t');
-        let code = fields.next().and_then(|m| m.rsplit(' ').next()).unwrap_or_default();
+        let head = fields.next().unwrap_or_default();
+        let code = head.rsplit(' ').next().unwrap_or_default();
+        let gitlink = head.split(' ').take(2).any(|mode| mode == "160000");
         let path = |p: Option<&str>| -> Result<String, String> {
             let p = p.ok_or_else(|| format!("truncated raw diff line: {line}"))?;
             Ok(if p.starts_with('"') { unquote(p) } else { p.to_owned() })
@@ -202,7 +206,7 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
                 (Status::Modified, Some(p.clone()), Some(p))
             }
         };
-        files.push(FileChange { old_path, new_path, status, new_ranges: Vec::new(), old_ranges: Vec::new() });
+        files.push(FileChange { old_path, new_path, status, new_ranges: Vec::new(), old_ranges: Vec::new(), gitlink });
     }
 
     let hunks = parse_hunks(&out);
@@ -223,6 +227,7 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
                 status: Status::Untracked,
                 new_ranges: vec![(1, lines)],
                 old_ranges: Vec::new(),
+                gitlink: false,
             });
         }
     }
@@ -231,7 +236,8 @@ pub fn changed_files(root: &Path, base: &str, target: &Target, untracked: bool) 
 
 /// Keeps the changes under `patterns` (paths, directories or globs). A pattern naming one existing
 /// file (not a directory, not a glob) that has no change in scope is added as wholly changed, so
-/// `--files src/x.rs` means "the impact of this file"; directories and globs only narrow.
+/// `--files src/x.rs` means "the impact of this file"; directories and globs only narrow. A binary
+/// file counts too, with no line ranges (as git diffs one).
 pub fn restrict(files: Vec<FileChange>, patterns: &[String], source: &mut Source) -> Result<Vec<FileChange>, String> {
     let mut b = globset::GlobSetBuilder::new();
     let mut plain: Vec<&str> = Vec::new();
@@ -251,15 +257,19 @@ pub fn restrict(files: Vec<FileChange>, patterns: &[String], source: &mut Source
         if kept.iter().any(|f| f.new_path.as_deref() == Some(path)) {
             continue;
         }
-        // `read` yields nothing for a directory (a tree at a revision) or a missing path.
-        let Some(text) = source.read(path) else { continue };
-        let lines = text.lines().count().max(1) as u32;
+        // Nothing for a directory (a tree at a revision) or a missing path.
+        let Some(text) = source.read_blob(path) else { continue };
+        let ranges = match text {
+            Some(text) => vec![(1, text.lines().count().max(1) as u32)],
+            None => Vec::new(),
+        };
         kept.push(FileChange {
             old_path: Some(path.to_owned()),
             new_path: Some(path.to_owned()),
             status: Status::Modified,
-            new_ranges: vec![(1, lines)],
-            old_ranges: vec![(1, lines)],
+            new_ranges: ranges.clone(),
+            old_ranges: ranges,
+            gitlink: false,
         });
     }
     Ok(kept)
@@ -384,14 +394,54 @@ impl Source {
 
     /// Repo-relative path → contents (None when absent or not UTF-8).
     pub fn read(&mut self, path: &str) -> Option<String> {
+        self.read_blob(path).flatten()
+    }
+
+    /// Repo-relative path → `Some(Some(text))` for a text file, `Some(None)` for a binary one,
+    /// `None` when absent or not a file.
+    pub fn read_blob(&mut self, path: &str) -> Option<Option<String>> {
         match self {
-            Source::Disk(root) => std::fs::read_to_string(root.join(path)).ok(),
+            Source::Disk(root) => std::fs::read(root.join(path)).ok().map(|b| String::from_utf8(b).ok()),
             Source::Rev { rev, stdin, stdout, .. } => {
                 writeln!(stdin, "{rev}:{path}").ok()?;
                 stdin.flush().ok()?;
                 answer(stdout)
             }
         }
+    }
+
+    /// Every file of this side with its blob id (`git hash-object` of the content), from one `git
+    /// ls-tree` at a revision or one `git ls-files -s` of the index. The working tree is the
+    /// index's tracked files plus untracked ones that are not ignored; a file the working tree
+    /// changed (or an untracked one) has no id: only its content says what it holds.
+    pub fn files(&self, root: &Path) -> Result<Vec<(String, Option<String>)>, String> {
+        // `ls-tree`: `<mode> <type> <id>\t<path>`; `ls-files -s`: `<mode> <id> <stage>\t<path>`,
+        // and with `--others` a bare `<path>` for an untracked file.
+        let (args, field): (&[&str], usize) = match self {
+            Source::Disk(_) => (&["ls-files", "-s", "-z", "--cached", "--others", "--exclude-standard"], 1),
+            Source::Rev { rev, .. } if rev.is_empty() => (&["ls-files", "-s", "-z"], 1),
+            Source::Rev { rev, .. } => (&["ls-tree", "-r", "-z", rev], 2),
+        };
+        let out = git(root, args)?;
+        let changed = match self {
+            Source::Disk(_) => git(root, &["diff-files", "--name-only", "-z"])?,
+            Source::Rev { .. } => String::new(),
+        };
+        let changed: HashSet<&str> = changed.split('\0').filter(|p| !p.is_empty()).collect();
+        let mut files: Vec<(String, Option<String>)> = out
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| match entry.split_once('\t') {
+                Some((meta, path)) => {
+                    let id = meta.split(' ').nth(field).filter(|_| !changed.contains(path));
+                    (path.to_owned(), id.map(str::to_owned))
+                }
+                None => (entry.to_owned(), None),
+            })
+            .collect();
+        // A conflicted path is listed once per stage.
+        files.dedup_by(|b, a| a.0 == b.0);
+        Ok(files)
     }
 
     /// [`Source::read`] for many paths. At a revision every request is written before the
@@ -404,33 +454,10 @@ impl Source {
                 // A writer thread feeds cat-file while this one drains it, so neither pipe fills up.
                 std::thread::scope(|s| {
                     let writer = s.spawn(move || stdin.write_all(requests.as_bytes()).and_then(|()| stdin.flush()));
-                    let out = paths.iter().map(|_| answer(stdout)).collect();
+                    let out = paths.iter().map(|_| answer(stdout).flatten()).collect();
                     let _ = writer.join();
                     out
                 })
-            }
-        }
-    }
-
-    /// Every file under `dir` (repo-relative, `""` = root), repo-relative paths.
-    pub fn list(&self, root: &Path, dir: &str) -> Result<Vec<String>, String> {
-        match self {
-            Source::Disk(_) => {
-                let mut out = Vec::new();
-                walk_disk(root, dir, &mut out);
-                out.sort_unstable();
-                Ok(out)
-            }
-            Source::Rev { rev, .. } => {
-                let mut args = if rev.is_empty() {
-                    vec!["ls-files", "-z"]
-                } else {
-                    vec!["ls-tree", "-r", "--name-only", "-z", rev.as_str()]
-                };
-                if !dir.is_empty() {
-                    args.extend(["--", dir]);
-                }
-                Ok(git(root, &args)?.split('\0').filter(|s| !s.is_empty()).map(str::to_owned).collect())
             }
         }
     }
@@ -445,8 +472,9 @@ impl Drop for Source {
     }
 }
 
-/// One `git cat-file --batch` answer: a blob's text, or `None` (missing, not a blob, not UTF-8).
-fn answer(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
+/// One `git cat-file --batch` answer: `Some(Some(text))` for a text blob, `Some(None)` for a binary
+/// one, `None` when missing or not a blob.
+fn answer(stdout: &mut BufReader<ChildStdout>) -> Option<Option<String>> {
     let mut header = String::new();
     stdout.read_line(&mut header).ok()?;
     let mut fields = header.split_ascii_whitespace();
@@ -459,22 +487,5 @@ fn answer(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
     if kind != "blob" {
         return None;
     }
-    String::from_utf8(buf).ok()
-}
-
-fn walk_disk(root: &Path, dir: &str, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(root.join(dir)) else { return };
-    for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else { continue };
-        let rel = if dir.is_empty() { name } else { format!("{dir}/{name}") };
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {
-                if !(rel == "target" || rel == ".git" || rel.ends_with("/target") || rel.ends_with("/.git")) {
-                    walk_disk(root, &rel, out);
-                }
-            }
-            Ok(t) if t.is_file() => out.push(rel),
-            _ => {}
-        }
-    }
+    Some(String::from_utf8(buf).ok())
 }

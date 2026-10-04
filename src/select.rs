@@ -186,7 +186,7 @@ pub struct Selection {
     pub rules_fired: Vec<RuleFired>,
     /// Changed packages, by name.
     pub changed: Vec<usize>,
-    /// (package, reverse-dependency hops); rule packages appear with 0.
+    /// (package, reverse-dependency hops); packages a rule names appear with 0.
     pub reached: Vec<(usize, u32)>,
     /// `pkg: module::Item` lines given to Jev and the report.
     pub symbols: Vec<String>,
@@ -246,12 +246,9 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
     let base = scope.base.clone();
     let target = scope.target.clone();
 
-    // Layer 1: intake (the diff the scope already ran), narrowed to `changes.files` when given.
+    // Layer 1: intake (the diff the scope already ran and narrowed to `changes.files`).
     let mut new_src = Source::new(root, &target)?;
-    let mut files = std::mem::take(&mut scope.changes);
-    if !cfg.changes.files.is_empty() {
-        files = git::restrict(files, &cfg.changes.files, &mut new_src)?;
-    }
+    let files = std::mem::take(&mut scope.changes);
     laps.mark("intake");
     let ws = Workspace::load(root)?;
     laps.mark("cargo metadata");
@@ -298,7 +295,9 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
     let mut full_reasons: Vec<String> = Vec::new();
     let mut seen_items: HashSet<(String, String)> = HashSet::new();
     // Non-ignored files outside every package and path dependency; `paths.outside` decides.
+    // `outside_gitlink[i]`: `outside[i]` is a submodule.
     let mut outside: Vec<String> = Vec::new();
+    let mut outside_gitlink: Vec<bool> = Vec::new();
     let mut path_deps = PathDeps::default();
     let root_pkg = ws.packages.iter().position(|p| p.dir.is_empty());
     for f in &files {
@@ -313,15 +312,15 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
                 out.escalations.push(Escalation { file: path.into(), kind: "full", package: None, reason: "paths.full_run".into() });
                 continue;
             }
-            let mut by_rule = false;
+            // Rules add must-runs; only an `exclusive` one replaces the handling below.
+            let mut exclusive = false;
             for (i, set) in rule_sets.iter().enumerate() {
-                if !set.is_match(path) {
-                    continue;
+                if set.is_match(path) {
+                    fired.entry(i).or_default().push(path.to_owned());
+                    exclusive |= cfg.rules[i].exclusive;
                 }
-                by_rule = true;
-                fired.entry(i).or_default().push(path.to_owned());
             }
-            if by_rule {
+            if exclusive {
                 continue;
             }
             if ignore.is_match(path) {
@@ -384,7 +383,10 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
                             }
                         }
                     }
-                    None => outside.push(path.to_owned()),
+                    None => {
+                        outside.push(path.to_owned());
+                        outside_gitlink.push(f.gitlink);
+                    }
                 }
                 continue;
             };
@@ -460,6 +462,9 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
     drop(old_src);
     laps.mark("path policy");
 
+    // Every file of the target side, listed once with blob ids for the reference scan and
+    // discovery.
+    let mut listing: Option<Vec<(String, Option<String>)>> = None;
     match cfg.paths.outside {
         Outside::Full => {
             for path in outside {
@@ -469,27 +474,47 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
         }
         Outside::Ignore => out.outside_ignored = outside,
         Outside::Referenced if !outside.is_empty() => {
-            let finder = outside::Finder::new(&outside);
+            let all = listing.insert(new_src.files(root)?);
+            let finder = outside::Finder::new(&outside, &outside_gitlink);
+            let index = outside::Index::new(&cfg.jev.cache_dir);
+            // (package, listing index) of every Rust file of every package, each scanned once.
+            let scanned: Vec<(usize, usize)> =
+                (0..ws.packages.len()).flat_map(|pkg| rust_files(all, &ws.packages[pkg].dir).into_iter().map(move |i| (pkg, i))).collect();
+            // Literals from the cache by blob id; the rest (and every working-tree file) read.
+            let mut literals: Vec<Option<Vec<outside::Literal>>> =
+                scanned.iter().map(|&(_, i)| all[i].1.as_deref().and_then(|id| index.get(id))).collect();
+            let missing: Vec<usize> = (0..scanned.len()).filter(|&k| literals[k].is_none()).collect();
+            let paths: Vec<String> = missing.iter().map(|&k| all[scanned[k].1].0.clone()).collect();
+            for (&k, src) in missing.iter().zip(new_src.read_many(&paths)) {
+                let Some(src) = src else { continue };
+                let (key, cached) = match &all[scanned[k].1].1 {
+                    Some(id) => (id.clone(), None),
+                    None => {
+                        let key = outside::content_key(&src);
+                        let cached = index.get(&key);
+                        (key, cached)
+                    }
+                };
+                literals[k] = Some(cached.unwrap_or_else(|| {
+                    let found = outside::literals(&src);
+                    index.put(&key, &found);
+                    found
+                }));
+            }
+            // (package, outside file) → the first literal naming it, packages in order.
+            let mut found: BTreeMap<(usize, usize), outside::Reference> = BTreeMap::new();
+            for (&(pkg, i), lits) in scanned.iter().zip(&literals) {
+                let Some(lits) = lits else { continue };
+                for r in finder.scan(&all[i].0, lits) {
+                    found.entry((pkg, r.file)).or_insert(r);
+                }
+            }
             let mut read = vec![false; outside.len()];
-            for pkg in 0..ws.packages.len() {
-                let pdir = ws.packages[pkg].dir.as_str();
-                let mut found: BTreeMap<usize, outside::Reference> = BTreeMap::new();
-                let paths = rust_files(&new_src.list(root, pdir)?, pdir);
-                for (path, src) in paths.iter().zip(new_src.read_many(&paths)) {
-                    let Some(src) = src else { continue };
-                    for r in finder.scan(path, &src) {
-                        found.entry(r.file).or_insert(r);
-                    }
-                    if found.len() == outside.len() {
-                        break;
-                    }
-                }
-                for (i, r) in found {
-                    read[i] = true;
-                    changed.insert(pkg);
-                    let why = format!("reads {} (\"{}\" at {})", outside[i], r.literal, r.at);
-                    whole_package(&mut out.whole, &mut out.escalations, pkg, &outside[i], why);
-                }
+            for ((pkg, i), r) in found {
+                read[i] = true;
+                changed.insert(pkg);
+                let why = format!("reads {} (\"{}\" at {})", outside[i], r.literal, r.at);
+                whole_package(&mut out.whole, &mut out.escalations, pkg, &outside[i], why);
             }
             out.outside_ignored = outside.into_iter().zip(read).filter(|(_, r)| !r).map(|(p, _)| p).collect();
         }
@@ -497,18 +522,25 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
     }
 
     laps.mark("outside references");
+    // Packages a fired rule names: run whole, and (unless `reach = false`) reach their reverse
+    // dependencies as a changed package does.
+    let mut seeds: BTreeSet<usize> = BTreeSet::new();
     for (index, files) in fired {
         let rule = &cfg.rules[index];
         out.rule_runs.extend(rule.run.iter().cloned());
         for name in &rule.packages {
             let pkg = ws.by_name(name).ok_or_else(|| format!("[[rule]] #{}: no workspace package `{name}`", index + 1))?;
             out.whole.entry(pkg).or_insert_with(|| format!("[[rule]] #{}", index + 1));
+            if rule.reach {
+                seeds.insert(pkg);
+            }
         }
         if rule.full {
             full_reasons.push(format!("[[rule]] #{} (full = true) fired on {}", index + 1, files.join(", ")));
         }
         out.rules_fired.push(RuleFired { index, files });
     }
+    out.rule_runs.sort_unstable();
     out.rule_runs.dedup();
     for (&pkg, whys) in &out.dependency {
         for why in whys {
@@ -519,10 +551,15 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
         out.full = Some(full_reasons.join("; "));
     }
 
-    // Layer 3: reach.
+    // Layer 3: reach, from the changed packages and the packages rules name.
+    let by_name = |a: &usize, b: &usize| ws.packages[*a].name.cmp(&ws.packages[*b].name);
     let mut changed: Vec<usize> = changed.into_iter().collect();
-    changed.sort_unstable_by(|&a, &b| ws.packages[a].name.cmp(&ws.packages[b].name));
-    let mut reached = ws.affected(&changed, sel.reach_depth);
+    changed.sort_unstable_by(by_name);
+    let mut from = changed.clone();
+    let mut extra: Vec<usize> = seeds.into_iter().filter(|p| !changed.contains(p)).collect();
+    extra.sort_unstable_by(by_name);
+    from.extend(extra);
+    let mut reached = ws.affected(&from, sel.reach_depth);
     for &pkg in out.whole.keys() {
         if !reached.iter().any(|r| r.0 == pkg) {
             reached.push((pkg, 0));
@@ -545,13 +582,16 @@ pub fn run(root: &Path, cfg: &Config, mut scope: crate::changes::Scope, sw: &Swi
     let new_ranges: HashMap<&str, &[Range]> =
         out.files.iter().filter_map(|f| Some((f.new_path.as_deref()?, f.new_ranges.as_slice()))).collect();
     // Every candidate file of every reached package, read in one batch, parsed on all cores.
+    if listing.is_none() {
+        listing = Some(new_src.files(root)?);
+    }
+    let all = listing.as_deref().unwrap_or_default();
     let mut owners: Vec<(usize, u32)> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     for &(pkg, depth) in &out.reached {
-        let pdir = ws.packages[pkg].dir.as_str();
-        for path in test_files(&new_src.list(root, pdir)?, pdir) {
+        for i in test_files(all, &ws.packages[pkg].dir) {
             owners.push((pkg, depth));
-            paths.push(path);
+            paths.push(all[i].0.clone());
         }
     }
     let texts = new_src.read_many(&paths);
@@ -1067,37 +1107,35 @@ fn parse_parallel<T: Send>(sources: &[(String, String)], f: impl Fn(usize, &syn:
     out.into_iter().map(|r| r.unwrap_or_else(|| Err("not parsed".into()))).collect()
 }
 
-/// Repo-relative `.rs` files under package dir `pdir` that may hold its tests.
-fn test_files(all: &[String], pdir: &str) -> Vec<String> {
+/// Listing indices of the `.rs` files under package dir `pdir` that may hold its tests.
+fn test_files(all: &[(String, Option<String>)], pdir: &str) -> Vec<usize> {
     package_rs(all, pdir, false)
 }
 
-/// Every repo-relative `.rs` file of the package at `pdir` (build.rs, benches and examples too).
-fn rust_files(all: &[String], pdir: &str) -> Vec<String> {
+/// Listing indices of every `.rs` file of the package at `pdir` (build.rs, benches and examples too).
+fn rust_files(all: &[(String, Option<String>)], pdir: &str) -> Vec<usize> {
     package_rs(all, pdir, true)
 }
 
 /// `.rs` files under `pdir`, minus `target/` and nested packages; benches and examples only with
 /// `all_targets`.
-fn package_rs(all: &[String], pdir: &str, all_targets: bool) -> Vec<String> {
-    let rel = |p: &str| -> Option<String> {
-        if pdir.is_empty() { Some(p.to_owned()) } else { p.strip_prefix(pdir)?.strip_prefix('/').map(str::to_owned) }
-    };
+fn package_rs(all: &[(String, Option<String>)], pdir: &str, all_targets: bool) -> Vec<usize> {
+    fn rel<'p>(p: &'p str, pdir: &str) -> Option<&'p str> {
+        if pdir.is_empty() { Some(p) } else { p.strip_prefix(pdir)?.strip_prefix('/') }
+    }
     // Subdirectories (relative to the package) holding their own Cargo.toml.
-    let nested: HashSet<String> = all
-        .iter()
-        .filter_map(|p| rel(p))
-        .filter_map(|r| r.strip_suffix("/Cargo.toml").map(str::to_owned))
-        .collect();
-    all.iter()
-        .filter(|p| p.ends_with(".rs"))
-        .filter(|p| {
-            let Some(r) = rel(p) else { return false };
+    let nested: HashSet<&str> = all.iter().filter_map(|(p, _)| rel(p, pdir)?.strip_suffix("/Cargo.toml")).collect();
+    (0..all.len())
+        .filter(|&i| {
+            let p = &all[i].0;
+            if !p.ends_with(".rs") {
+                return false;
+            }
+            let Some(r) = rel(p, pdir) else { return false };
             if (!all_targets && (r.starts_with("benches/") || r.starts_with("examples/"))) || r.split('/').any(|c| c == "target") {
                 return false;
             }
             !r.match_indices('/').any(|(i, _)| nested.contains(&r[..i]))
         })
-        .cloned()
         .collect()
 }

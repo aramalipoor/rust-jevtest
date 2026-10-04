@@ -36,8 +36,13 @@ pub struct Scope {
     pub why: String,
     /// The committed scope auto narrowed away from, when the size guard fired.
     pub narrowed_from: Option<String>,
+    /// Changed files not matching `paths.ignore`, and the changed lines of those, both sides.
     pub files: usize,
     pub lines: usize,
+    /// Changed files matching `paths.ignore`.
+    pub ignored: usize,
+    /// `files` before `changes.files` (`--files`) narrowed the diff.
+    pub files_of: Option<usize>,
     /// The diff itself (ignored paths included), so intake does not run it again.
     pub changes: Vec<FileChange>,
 }
@@ -46,7 +51,9 @@ impl Scope {
     /// The stderr line naming the choice.
     pub fn line(&self) -> String {
         let s = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-        format!("jevtest: changes = {} ({}) · {}, {}", self.what, self.why, s(self.files, "file"), s(self.lines, "line"))
+        let ignored = if self.ignored > 0 { format!(" (+{} ignored)", self.ignored) } else { String::new() };
+        let of = self.files_of.map(|n| format!(" of {n} (--files)")).unwrap_or_default();
+        format!("jevtest: changes = {} ({}) · {}{ignored}{of}, {}", self.what, self.why, s(self.files, "file"), s(self.lines, "line"))
     }
 
     pub fn report(&self) -> Value {
@@ -58,14 +65,16 @@ impl Scope {
             "base": self.base,
             "head": self.target.label(),
             "files": self.files,
+            "ignored_files": self.ignored,
+            "files_before_narrowing": self.files_of,
             "lines": self.lines,
             "narrowed_from": self.narrowed_from,
         })
     }
 }
 
-/// Resolves the request against `[changes]`. `ignore` keeps ignored paths out of the dirty check
-/// and the size guard.
+/// Resolves the request against `[changes]`, then narrows the diff to `changes.files` (`--files`).
+/// `ignore` keeps ignored paths out of the dirty check, the size guard and the counts.
 pub fn resolve(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet) -> Result<Scope, String> {
     let mode = req.mode.unwrap_or(cfg.mode);
     let mut scope = resolve_mode(root, cfg, req, ignore, mode)?;
@@ -79,6 +88,12 @@ pub fn resolve(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet) -> R
         ChangeMode::Since => "since",
         ChangeMode::Range => "range",
     };
+    if !cfg.files.is_empty() {
+        let mut source = git::Source::new(root, &scope.target)?;
+        let d = measure(git::restrict(std::mem::take(&mut scope.changes), &cfg.files, &mut source)?, ignore);
+        scope.files_of = Some(scope.files);
+        (scope.files, scope.lines, scope.ignored, scope.changes) = (d.files, d.lines, d.ignored, d.changes);
+    }
     Ok(scope)
 }
 
@@ -99,6 +114,8 @@ fn resolve_mode(root: &Path, cfg: &Changes, req: &Request, ignore: &GlobSet, mod
             narrowed_from: None,
             files: d.files,
             lines: d.lines,
+            ignored: d.ignored,
+            files_of: None,
             changes: d.changes,
         })
     };
@@ -170,6 +187,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             narrowed_from: None,
             files: dirty.files,
             lines: dirty.lines,
+            ignored: dirty.ignored,
+            files_of: None,
             changes: dirty.changes,
         });
     }
@@ -188,6 +207,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             narrowed_from: None,
             files: d.files,
             lines: d.lines,
+            ignored: d.ignored,
+            files_of: None,
             changes: d.changes,
         })
     };
@@ -218,6 +239,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
             narrowed_from: None,
             files,
             lines,
+            ignored: d.ignored,
+            files_of: None,
             changes: d.changes,
         });
     }
@@ -239,6 +262,8 @@ fn auto(root: &Path, cfg: &Changes, ignore: &GlobSet, has_head: bool) -> Result<
                 narrowed_from,
                 files: d.files,
                 lines: d.lines,
+                ignored: d.ignored,
+                files_of: None,
                 changes: d.changes,
             });
         }
@@ -286,12 +311,18 @@ struct Diff {
     files: usize,
     /// Changed lines of those files, both sides.
     lines: usize,
+    /// Ignored changed files.
+    ignored: usize,
     changes: Vec<FileChange>,
 }
 
 /// The diff of `base` against `target`, sized without ignored paths.
 fn size(root: &Path, base: &str, target: &Target, untracked: bool, ignore: &GlobSet) -> Result<Diff, String> {
-    let changes = git::changed_files(root, base, target, untracked)?;
+    Ok(measure(git::changed_files(root, base, target, untracked)?, ignore))
+}
+
+/// Counts the files of `changes` not matching `ignore` and their changed lines.
+fn measure(changes: Vec<FileChange>, ignore: &GlobSet) -> Diff {
     let mut files = 0;
     let mut lines = 0;
     for f in changes.iter().filter(|f| !ignore.is_match(f.path())) {
@@ -300,5 +331,5 @@ fn size(root: &Path, base: &str, target: &Target, untracked: bool, ignore: &Glob
             lines += (b - a + 1) as usize;
         }
     }
-    Ok(Diff { files, lines, changes })
+    Diff { files, lines, ignored: changes.len() - files, changes }
 }

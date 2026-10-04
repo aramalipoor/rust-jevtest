@@ -229,14 +229,26 @@ impl Default for Paths {
 }
 
 /// `[[rule]]`: when any `when` glob matches a changed file, run the `run` filtersets, the whole
-/// `packages`, or everything (`full`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `packages` (reaching their reverse dependencies unless `reach = false`), or everything
+/// (`full`). A rule adds to jevtest's own handling of the file; `exclusive = true` replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Rule {
     pub when: Vec<String>,
     pub run: Vec<String>,
     pub packages: Vec<String>,
     pub full: bool,
+    /// The rule's must-runs replace jevtest's own handling of the matched file (the non-Rust
+    /// whole-package run, the `referenced` match, the changed items of a `.rs` file).
+    pub exclusive: bool,
+    /// `packages` reach their reverse dependencies, as a changed package does.
+    pub reach: bool,
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Self { when: Vec::new(), run: Vec::new(), packages: Vec::new(), full: false, exclusive: false, reach: true }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -613,8 +625,11 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 #                             # The root Cargo.toml and Cargo.lock are read, not matched: version stamps are ignored,
 #                             # dependency changes make the packages that use them changed, anything else runs the full suite.
 # outside = "referenced"      # referenced | full | ignore: a changed file outside every package runs the packages whose
-#                             # Rust source names it (path, basename or parent directory in a string literal) whole;
-#                             # files nothing names are ignored
+#                             # Rust source names it in a string literal whole: its path or last two components, a
+#                             # parent directory, a submodule path as the start of a longer one, or a basename with an
+#                             # extension, 5+ characters and not a common name (mod.rs, lib.rs, main.rs, README.md,
+#                             # AGENTS.md, Cargo.toml, index.html); files nothing names are ignored. Literals are cached
+#                             # per blob under jev.cache_dir.
 
 [tests]
 # always = []                 # nextest filtersets always run (smoke tests)
@@ -633,7 +648,7 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # max_test_chars = 800                                  # test source per body question, in chars
 # max_group_chars = 600                                 # group description per screening question, in chars
 # timeout_secs = 30                                     # per-request timeout, in seconds
-# cache_dir = "~/.cache/jevtest"                        # answer cache, per question; `cargo jevtest cache clear` empties it
+# cache_dir = "~/.cache/jevtest"                        # answer cache, per question, and the literal index of `paths.outside = "referenced"`; `cargo jevtest cache clear` empties both
 
 [coverage]
 # Per-test coverage map from `cargo jevtest coverage build` (build it nightly on the default branch).
@@ -648,11 +663,16 @@ pub const TEMPLATE: &str = r#"# jevtest.toml — settings for `cargo jevtest` (h
 # jobs = 0                    # parallel mapping jobs in `coverage build` (0 = one per core)
 
 # Path-triggered must-runs: when any `when` glob matches a changed file, run the `run` filtersets,
-# the whole `packages`, or everything (`full = true`). Repeat the block for more rules.
+# the whole `packages`, or everything (`full = true`). A rule adds to jevtest's own handling of the
+# file (a non-Rust file's whole-package run, a `referenced` match, a .rs file's changed items).
+# Repeat the block for more rules.
 # [[rule]]
 # when = ["crates/core/migrations/**"]
 # run = ["package(=core) & test(/store::/)"]   # nextest filtersets
 # packages = []                                # packages to run whole
+# reach = true                                 # packages also reach their reverse dependencies, like a changed package
+# exclusive = false                            # true = the rule replaces jevtest's own handling of the file
+#                                              #   (narrow a whole-package run to one binary with `run`)
 # full = false                                 # true = run the full suite
 
 # Profiles override any [select], [changes], [tests], [jev] or [coverage] key; pick one with

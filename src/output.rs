@@ -1,5 +1,6 @@
 //! Layer 9: runner commands, the nextest filter, the stderr summary, the JSON report and `explain`.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde_json::{Value, json};
@@ -299,8 +300,12 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
         s.target.label(),
         profile.map(|p| format!(", profile {p}")).unwrap_or_default()
     );
-    let rs = s.files.iter().filter(|f| f.path().ends_with(".rs")).count();
-    let _ = writeln!(o, "intake: {} changed files ({rs} .rs), {} changed items", s.files.len(), s.items.len());
+    // The files the `jevtest: changes` line counts; ignored ones apart.
+    let ignore = crate::select::globset(&cfg.paths.ignore).unwrap_or_else(|_| globset::GlobSet::empty());
+    let rs = s.files.iter().filter(|f| f.path().ends_with(".rs") && !ignore.is_match(f.path())).count();
+    let ignored = if s.scope.ignored > 0 { format!(", +{} ignored", s.scope.ignored) } else { String::new() };
+    let n = s.scope.files;
+    let _ = writeln!(o, "intake: {n} changed file{} ({rs} .rs{ignored}), {} changed items", if n == 1 { "" } else { "s" }, s.items.len());
     if verbose {
         for f in &s.files {
             match (&f.old_path, &f.new_path) {
@@ -341,15 +346,23 @@ pub fn summary(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan, 
     for r in &s.rules_fired {
         let _ = writeln!(o, "path policy: [[rule]] #{} fired on {}", r.index + 1, r.files.join(", "));
     }
-    let reached: Vec<String> =
-        s.reached.iter().map(|&(p, d)| if d == 0 { name(p).to_owned() } else { format!("{}+{d}", name(p)) }).collect();
+    // Reached packages grouped by reverse-dependency hops: `0 hops [..]; 1 hop [..]; 2 hops [..]`.
+    let mut by_depth: BTreeMap<u32, Vec<&str>> = BTreeMap::new();
+    for &(p, d) in &s.reached {
+        by_depth.entry(d).or_default().push(name(p));
+    }
+    let reached: Vec<String> = by_depth
+        .iter()
+        .map(|(&d, names)| format!("{d} hop{} [{}]", if d == 1 { "" } else { "s" }, names.join(", ")))
+        .collect();
     let _ = writeln!(
         o,
-        "reach: changed {} [{}]; reached {} [{}]",
+        "reach: changed {} [{}]; reached {}{}{}",
         s.changed.len(),
         s.changed.iter().map(|&p| name(p)).collect::<Vec<_>>().join(", "),
         s.reached.len(),
-        reached.join(", ")
+        if reached.is_empty() { "" } else { ": " },
+        reached.join("; ")
     );
     if let Some(why) = &s.full {
         let _ = writeln!(o, "FULL RUN: {why}");
@@ -556,6 +569,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
             "status": f.status.as_str(),
             "new_ranges": f.new_ranges,
             "old_ranges": f.old_ranges,
+            "submodule": f.gitlink,
         })).collect::<Vec<_>>(),
         "ignored_files": s.ignored,
         "outside_ignored_files": s.outside_ignored,
@@ -567,7 +581,7 @@ pub fn report(s: &Selection, cfg: &Config, profile: Option<&str>, plan: &Plan) -
         })).collect::<Vec<_>>(),
         "rules_fired": s.rules_fired.iter().map(|r| {
             let rule = &cfg.rules[r.index];
-            json!({"rule": r.index + 1, "files": r.files, "run": rule.run, "packages": rule.packages, "full": rule.full})
+            json!({"rule": r.index + 1, "files": r.files, "run": rule.run, "packages": rule.packages, "reach": rule.reach, "exclusive": rule.exclusive, "full": rule.full})
         }).collect::<Vec<_>>(),
         "full_run": s.full,
         "changed_packages": s.changed.iter().map(|&p| name(p)).collect::<Vec<_>>(),
@@ -664,7 +678,11 @@ pub fn explain(s: &Selection, cfg: &Config, pattern: &str) -> String {
         let _ = writeln!(
             o,
             "  reach:      {}",
-            if c.depth == 0 { "changed package".to_owned() } else { format!("{} reverse-dependency hop(s) from a changed package", c.depth) }
+            match c.depth {
+                0 => "0 hops: a changed package, or one a [[rule]] names".to_owned(),
+                1 => "1 hop from a changed package".to_owned(),
+                d => format!("{d} hops from a changed package"),
+            }
         );
         let _ = writeln!(
             o,

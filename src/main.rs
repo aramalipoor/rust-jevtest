@@ -54,7 +54,7 @@ enum Cmd {
     },
     /// Check git, cargo metadata, the runner, the API key and one tiny Jev call.
     Doctor,
-    /// Manage the Jev answer cache.
+    /// Manage the cache (Jev answers, the literal index of `paths.outside = "referenced"`).
     Cache {
         #[command(subcommand)]
         action: CacheAction,
@@ -68,7 +68,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CacheAction {
-    /// Delete every cached Jev answer.
+    /// Delete every cached Jev answer and the literal index.
     Clear,
 }
 
@@ -463,7 +463,12 @@ fn cache_clear(g: &Global) -> Result<ExitCode, String> {
             }
         }
     }
-    eprintln!("removed {removed} cached answers from {}", dir.display());
+    let literals = std::fs::remove_dir_all(dir.join(outside::INDEX_DIR)).is_ok();
+    eprintln!(
+        "removed {removed} cached answers{} from {}",
+        if literals { " and the literal index" } else { "" },
+        dir.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

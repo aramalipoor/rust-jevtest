@@ -1,6 +1,6 @@
 [package]
 name = "jevtest"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Run only the Rust tests your change can break: crate reach, syn test discovery, a per-test coverage map and TypeSafe Jev judgments, as a cargo nextest filter."
 license = "MIT OR Apache-2.0"
